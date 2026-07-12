@@ -16,6 +16,7 @@ import fitz
 
 from .detect_ocr import detect_page_ocr, page_image_rects
 from .detect_text import delete_rrn_annots, detect_annots, detect_text
+from .edit import apply_edits
 from .findings import Finding, dedup
 from .mask import apply_masks
 
@@ -97,8 +98,16 @@ def detect(doc, opts, progress=None, **pinfo) -> List[Finding]:
 # masking / save
 # --------------------------------------------------------------------------
 
-def apply_and_save(doc, findings, opts, out_path, progress=None, **pinfo):
-    """Apply enabled findings and save the masked PDF. Returns (count, png_paths)."""
+def apply_and_save(doc, findings, opts, out_path, edits=None, progress=None, **pinfo):
+    """Apply text edits, then enabled findings; save. Returns (count, png_paths).
+
+    *edits* (GUI only, list of EditOp) are applied first: each edit's own
+    redaction completes before the mask redactions run, so an edit and a mask
+    on the same page never interfere.
+    """
+    if edits:
+        apply_edits(doc, edits)
+
     by_page = {}
     for f in findings:
         if not f.enabled:
@@ -179,13 +188,22 @@ def _save_pngs(doc, out_path, dpi=150):
 # one-shot convenience (used by the CLI)
 # --------------------------------------------------------------------------
 
-def run(input_path, opts, progress=None, **pinfo):
-    """Detect + mask + save one document. Returns a report dict."""
+def run(input_path, opts, progress=None, edits=None, **pinfo):
+    """Detect + mask + save one document. Returns a report dict.
+
+    *edits* (GUI batch path) are applied to the freshly opened document
+    before detection, so detection sees the edited content; apply_and_save
+    is then called without edits (already applied).
+    """
     doc = open_document(input_path)
     try:
+        if edits:
+            apply_edits(doc, edits)
         findings = detect(doc, opts, progress, **pinfo)
         out_path = output_path_for(input_path, opts)
-        masked, pngs = apply_and_save(doc, findings, opts, out_path, progress, **pinfo)
+        masked, pngs = apply_and_save(
+            doc, findings, opts, out_path, progress=progress, **pinfo
+        )
         return {
             "input": os.path.abspath(input_path),
             "output": os.path.abspath(out_path),
