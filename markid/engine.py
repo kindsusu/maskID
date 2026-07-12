@@ -61,11 +61,11 @@ def open_document(path):
     return doc
 
 
-def output_path_for(input_path, opts):
+def output_path_for(input_path, opts, suffix="_masked"):
     outdir = opts.outdir or os.path.join(
         os.path.dirname(os.path.abspath(input_path)), "masked"
     )
-    name = os.path.splitext(os.path.basename(input_path))[0] + "_masked.pdf"
+    name = os.path.splitext(os.path.basename(input_path))[0] + suffix + ".pdf"
     return os.path.join(outdir, name)
 
 
@@ -171,6 +171,27 @@ def _page_line_bboxes(page):
             if bb:
                 out.append(tuple(bb))
     return out
+
+
+def save_edits_only(input_path, edits, opts):
+    """Apply enabled text edits and save — no detection, masking or annot
+    deletion whatsoever (GUI '수정만 저장').
+
+    Output uses the same directory rule as masking but the ``_edited.pdf``
+    suffix so it never collides with a ``_masked.pdf``.
+    Returns (applied_count, out_path, png_paths).
+    """
+    doc = open_document(input_path)
+    try:
+        enabled = [e for e in (edits or []) if e.enabled]
+        apply_edits(doc, enabled)
+        out_path = output_path_for(input_path, opts, suffix="_edited")
+        os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
+        doc.save(out_path, garbage=3, deflate=True)
+        pngs = _save_pngs(doc, out_path) if opts.png else []
+        return len(enabled), out_path, pngs
+    finally:
+        doc.close()
 
 
 def _save_pngs(doc, out_path, dpi=150):

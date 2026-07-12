@@ -29,6 +29,7 @@ from .engine import (
     open_document,
     output_path_for,
     run,
+    save_edits_only,
 )
 from .findings import KIND_LABEL_KO, SOURCE_LABEL_KO, Finding
 
@@ -74,6 +75,7 @@ class MarkIDApp:
         self.preview_mode = "original"
         self.scale = 1.0
         self.zoom = 1.0             # 1.0 = fit-to-window scale
+        self.show_overlays = True   # draw detection/edit boxes on the preview
         self.tkimg = None
         self.manual_mode = False
         self.edit_mode = False
@@ -162,6 +164,9 @@ class MarkIDApp:
         self.btn_detect.pack(fill="x")
         self.btn_mask = ttk.Button(parent, text="② 마스킹 실행", command=self.on_mask)
         self.btn_mask.pack(fill="x", pady=4)
+        self.btn_editsave = ttk.Button(parent, text="수정만 저장 (마스킹 없음)",
+                                       command=self.on_save_edits)
+        self.btn_editsave.pack(fill="x", pady=(0, 4))
         self.btn_batch = ttk.Button(parent, text="③ 전체 파일 일괄 처리", command=self.on_batch)
         self.btn_batch.pack(fill="x")
         self.btn_reset = ttk.Button(parent, text="초기화 (파일 닫기)", command=self.on_reset)
@@ -214,6 +219,8 @@ class MarkIDApp:
         self.lbl_zoom.pack(side="left")
         ttk.Button(top, text="＋", width=3, command=lambda: self.change_zoom(ZOOM_STEP)).pack(side="left")
         ttk.Button(top, text="창맞춤", command=self.zoom_fit).pack(side="left", padx=(2, 0))
+        self.btn_overlay = ttk.Button(top, text="표시 숨기기", command=self.toggle_overlays)
+        self.btn_overlay.pack(side="left", padx=(6, 0))
         self.lbl_mode = ttk.Label(top, text="원본", foreground="#333")
         self.lbl_mode.pack(side="left", padx=8)
 
@@ -275,6 +282,7 @@ class MarkIDApp:
         state = "disabled" if busy else "normal"
         self.btn_detect.config(state=state)
         self.btn_mask.config(state=state)
+        self.btn_editsave.config(state=state)
         self.btn_batch.config(state=state)
         self.btn_reset.config(state=state)
 
@@ -430,7 +438,19 @@ class MarkIDApp:
         if self.preview_mode == "original":
             self._draw_overlays()
 
+    def toggle_overlays(self):
+        """Hide/show detection, manual and edit boxes on the preview.
+
+        View-only: findings/edits stay enabled and are still applied.  The
+        tree double-click locator highlight is intentionally unaffected.
+        """
+        self.show_overlays = not self.show_overlays
+        self.btn_overlay.config(text="표시 숨기기" if self.show_overlays else "표시 보이기")
+        self.render_preview()
+
     def _draw_overlays(self):
+        if not self.show_overlays:
+            return
         for f in self.findings:
             if f.page != self.cur_page:
                 continue
@@ -723,6 +743,8 @@ class MarkIDApp:
                     self._on_mask_done(m["path"], m["count"], m.get("pngs", []))
                 elif k == "batch_done":
                     self._on_batch_done(m["done"], m["masked"], m["total"])
+                elif k == "editsave_done":
+                    self._on_editsave_done(m["path"], m["count"], m.get("pngs", []))
                 elif k == "work_rebuilt":
                     old = self.work_doc
                     self.work_doc = m["doc"]
@@ -787,6 +809,9 @@ class MarkIDApp:
         self.progress.config(mode="determinate", value=0)
         self._refresh_tree()
         self.preview_mode = "original"
+        # fresh detections must be visible - re-enable hidden overlays
+        self.show_overlays = True
+        self.btn_overlay.config(text="표시 숨기기")
         self.render_preview()
         self.log_msg("검사 완료: %d건 검출" % len(findings))
         # ② was pressed without findings: continue straight into masking.
@@ -872,6 +897,53 @@ class MarkIDApp:
         if pngs:
             self.log_msg("PNG %d장 저장" % len(pngs))
         messagebox.showinfo("완료", "%d건 마스킹 완료\n%s" % (count, path))
+
+    # --------------------------------------------------- save edits only
+    def on_save_edits(self):
+        """Save a copy with only the enabled text edits applied (no masking)."""
+        if self._busy:
+            return
+        path = self._current_file()
+        if not path:
+            messagebox.showwarning("알림", "먼저 파일을 추가하세요.")
+            return
+        enabled = [e for e in self.edits if e.enabled]
+        if not enabled:
+            messagebox.showinfo("알림", "적용할 글자 수정이 없습니다")
+            return
+        self._release_result_doc()
+        opts = self._opts()
+        edits = list(self.edits)
+        self._set_busy(True)
+        self.progress.config(mode="indeterminate")
+        self.progress.start(20)
+        self.log_msg("수정만 저장 실행...")
+        threading.Thread(target=self._editsave_worker, args=(path, opts, edits),
+                         daemon=True).start()
+
+    def _editsave_worker(self, path, opts, edits):
+        try:
+            count, out_path, pngs = save_edits_only(path, edits, opts)
+            self._result_tmp = fitz.open(out_path)
+            self._post("editsave_done", path=out_path, count=count, pngs=pngs)
+        except EncryptedPdfError as e:
+            self._post("error", text=str(e))
+        except Exception:  # noqa: BLE001
+            self._post("error", text=traceback.format_exc().splitlines()[-1])
+
+    def _on_editsave_done(self, path, count, pngs):
+        self.result_doc = getattr(self, "_result_tmp", None)
+        self.result_path = path
+        self._set_busy(False)
+        self.progress.stop()
+        self.progress.config(mode="determinate", value=0)
+        self.btn_toggle.config(state="normal", text="원본 보기")
+        self.preview_mode = "result"
+        self.render_preview()
+        self.log_msg("글자 수정 %d건 저장: %s" % (count, path))
+        if pngs:
+            self.log_msg("PNG %d장 저장" % len(pngs))
+        messagebox.showinfo("완료", "글자 수정 %d건 저장 완료\n%s" % (count, path))
 
     # --------------------------------------------------------- batch
     def on_batch(self):
