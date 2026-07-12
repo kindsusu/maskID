@@ -1,0 +1,14 @@
+# 개인정보 포함 파일 — 절대 커밋 금지
+*.pdf
+tests/
+SPEC.md
+
+# 빌드 산출물 (exe는 GitHub Release로 배포: 100MB 제한)
+dist/
+build/
+masked/
+smoke_out/
+
+# Python
+__pycache__/
+*.pyc
