@@ -95,6 +95,37 @@ def detect(doc, opts, progress=None, **pinfo) -> List[Finding]:
 
 
 # --------------------------------------------------------------------------
+# result re-verification
+# --------------------------------------------------------------------------
+
+def verify_result(doc, opts=None) -> dict:
+    """Re-scan a saved (masked) document for *residual* complete RRNs.
+
+    Re-runs the text-layer and annotation detectors (addresses OFF, no OCR)
+    and counts **only** ``kind == "rrn"`` (complete 13-digit) findings.
+    Partial RRNs and addresses are excluded on purpose to avoid over-alarming.
+    OCR is intentionally skipped for speed (a residual image number cannot be
+    confirmed cheaply); this is documented for the user in the README.
+
+    Returns ``{"residual": n, "pages": [...]}`` with 1-based, sorted,
+    de-duplicated page numbers that still carry a complete RRN.  A residual > 0
+    typically means the user unchecked (excluded) that finding on purpose — it
+    is reported honestly either way.
+    """
+    residual = 0
+    pages = set()
+    for i in range(doc.page_count):
+        page = doc[i]
+        found = detect_text(page, i, False)      # address=False
+        found += detect_annots(page, i)
+        for f in found:
+            if f.kind == "rrn":                  # complete RRN only
+                residual += 1
+                pages.add(i + 1)                 # 1-based for humans
+    return {"residual": residual, "pages": sorted(pages)}
+
+
+# --------------------------------------------------------------------------
 # masking / save
 # --------------------------------------------------------------------------
 
@@ -225,6 +256,16 @@ def run(input_path, opts, progress=None, edits=None, **pinfo):
         masked, pngs = apply_and_save(
             doc, findings, opts, out_path, progress=progress, **pinfo
         )
+        # Re-open the saved copy and confirm no complete RRN text remains.
+        verify = {"residual": -1, "pages": []}   # -1 == verification failed
+        try:
+            vdoc = fitz.open(out_path)
+            try:
+                verify = verify_result(vdoc, opts)
+            finally:
+                vdoc.close()
+        except Exception:
+            pass
         return {
             "input": os.path.abspath(input_path),
             "output": os.path.abspath(out_path),
@@ -235,6 +276,7 @@ def run(input_path, opts, progress=None, edits=None, **pinfo):
             "ocr": opts.ocr,
             "findings": [f.to_report() for f in findings],
             "png": [os.path.abspath(p) for p in pngs],
+            "verify": verify,
         }
     finally:
         doc.close()

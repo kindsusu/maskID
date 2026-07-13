@@ -42,4 +42,6 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon='assets/MarkID.ico',
+    version='version_info.txt',
 )

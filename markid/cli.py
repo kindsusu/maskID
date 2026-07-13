@@ -86,6 +86,8 @@ def run_cli(args):
             rep = run(path, opts, progress=_progress, file_index=i, file_total=n)
             reports.append(rep)
             _out("  done: %d masked -> %s" % (rep["masked_count"], _ascii(rep["output"])))
+            v = rep.get("verify") or {}
+            _out("  verify: residual=%d" % v.get("residual", 0))
         except EncryptedPdfError:
             _out("  ERROR: encrypted PDF is not supported")
             reports.append({"input": os.path.abspath(path), "error": "encrypted"})

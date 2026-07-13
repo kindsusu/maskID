@@ -27,6 +27,16 @@ def models_dir():
     return os.path.join(base_dir(), "models")
 
 
+def icon_path():
+    """Path to the bundled application icon (``assets/MarkID.ico``).
+
+    Works both in a source checkout and inside a PyInstaller one-file bundle
+    (``base_dir`` resolves ``sys._MEIPASS`` when frozen).  The .ico file itself
+    is produced by the build tooling; callers must tolerate its absence.
+    """
+    return os.path.join(base_dir(), "assets", "MarkID.ico")
+
+
 def rec_model_path():
     """Path to the Korean recognition ONNX model."""
     return os.path.join(models_dir(), "korean_rec.onnx")
