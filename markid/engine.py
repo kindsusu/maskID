@@ -27,6 +27,16 @@ class EncryptedPdfError(Exception):
     """Raised when an input PDF requires a password."""
 
 
+class OperationCancelled(Exception):
+    """Raised when the user aborts a long-running operation (GUI 중지)."""
+
+
+def _check_cancel(cancel):
+    """Raise OperationCancelled when the optional cancel event is set."""
+    if cancel is not None and cancel.is_set():
+        raise OperationCancelled()
+
+
 @dataclass
 class Options:
     scope: str = "back6"     # "full" | "back6"
@@ -70,14 +80,80 @@ def output_path_for(input_path, opts, suffix="_masked"):
 
 
 # --------------------------------------------------------------------------
+# page extraction
+# --------------------------------------------------------------------------
+
+def parse_page_ranges(text, page_count):
+    """Parse a 1-based page-range string like ``"1,3-5,7"``.
+
+    Returns a sorted, de-duplicated list of **0-based** page indices.
+    Raises ``ValueError`` with a Korean message on malformed input or
+    out-of-range pages (valid range: 1..*page_count*).
+    """
+    s = (text or "").strip()
+    if not s:
+        raise ValueError("페이지 범위를 입력하세요. (예: 1,3-5,7)")
+    pages = set()
+    for part in s.split(","):
+        tok = part.strip()
+        if not tok:
+            raise ValueError("페이지 범위에 빈 항목이 있습니다. (예: 1,3-5,7)")
+        if "-" in tok:
+            a, _, b = tok.partition("-")
+            a, b = a.strip(), b.strip()
+            if not (a.isdigit() and b.isdigit()):
+                raise ValueError("잘못된 페이지 범위 형식입니다: '%s' (예: 3-5)" % tok)
+            lo, hi = int(a), int(b)
+            if lo > hi:
+                raise ValueError("범위의 시작이 끝보다 큽니다: '%s'" % tok)
+        else:
+            if not tok.isdigit():
+                raise ValueError("잘못된 페이지 번호입니다: '%s'" % tok)
+            lo = hi = int(tok)
+        if lo < 1 or hi > page_count:
+            raise ValueError(
+                "페이지 번호는 1~%d 범위여야 합니다: '%s'" % (page_count, tok))
+        pages.update(range(lo - 1, hi))
+    return sorted(pages)
+
+
+def extract_pages(doc, pages):
+    """New document containing *pages* (0-based, ascending) of *doc*.
+
+    Consecutive indices are copied per contiguous run with ``insert_pdf``.
+    The caller owns (and must close/save) the returned document.
+    """
+    out = fitz.open()
+    if not pages:
+        return out
+    runs = []
+    start = prev = pages[0]
+    for p in pages[1:]:
+        if p == prev + 1:
+            prev = p
+        else:
+            runs.append((start, prev))
+            start = prev = p
+    runs.append((start, prev))
+    for a, b in runs:
+        out.insert_pdf(doc, from_page=a, to_page=b)
+    return out
+
+
+# --------------------------------------------------------------------------
 # detection
 # --------------------------------------------------------------------------
 
-def detect(doc, opts, progress=None, **pinfo) -> List[Finding]:
-    """Run all detectors over *doc* and return de-duplicated, id-numbered findings."""
+def detect(doc, opts, progress=None, cancel=None, **pinfo) -> List[Finding]:
+    """Run all detectors over *doc* and return de-duplicated, id-numbered findings.
+
+    *cancel* (optional ``threading.Event``) aborts at page / OCR-pass
+    boundaries by raising :class:`OperationCancelled`.
+    """
     findings: List[Finding] = []
     total = doc.page_count
     for i in range(total):
+        _check_cancel(cancel)
         page = doc[i]
         if progress:
             progress(stage="text", page=i, total=total, **pinfo)
@@ -86,7 +162,7 @@ def detect(doc, opts, progress=None, **pinfo) -> List[Finding]:
         if opts.ocr:
             irects = page_image_rects(page)
             findings += detect_page_ocr(
-                page, i, irects, opts.address, progress=progress
+                page, i, irects, opts.address, progress=progress, cancel=cancel
             )
     findings = dedup(findings)
     for idx, f in enumerate(findings):
@@ -129,12 +205,14 @@ def verify_result(doc, opts=None) -> dict:
 # masking / save
 # --------------------------------------------------------------------------
 
-def apply_and_save(doc, findings, opts, out_path, edits=None, progress=None, **pinfo):
+def apply_and_save(doc, findings, opts, out_path, edits=None, progress=None,
+                   cancel=None, **pinfo):
     """Apply text edits, then enabled findings; save. Returns (count, png_paths).
 
     *edits* (GUI only, list of EditOp) are applied first: each edit's own
     redaction completes before the mask redactions run, so an edit and a mask
-    on the same page never interfere.
+    on the same page never interfere.  *cancel* aborts at page boundaries —
+    always before the output file is written — via :class:`OperationCancelled`.
     """
     if edits:
         apply_edits(doc, edits)
@@ -160,6 +238,7 @@ def apply_and_save(doc, findings, opts, out_path, edits=None, progress=None, **p
     masked = 0
     total = doc.page_count
     for i in range(total):
+        _check_cancel(cancel)
         page = doc[i]
         delete_rrn_annots(page, skip_rects=keep_annot_rects.get(i))
         rects = by_page.get(i, [])
@@ -240,21 +319,23 @@ def _save_pngs(doc, out_path, dpi=150):
 # one-shot convenience (used by the CLI)
 # --------------------------------------------------------------------------
 
-def run(input_path, opts, progress=None, edits=None, **pinfo):
+def run(input_path, opts, progress=None, edits=None, cancel=None, **pinfo):
     """Detect + mask + save one document. Returns a report dict.
 
     *edits* (GUI batch path) are applied to the freshly opened document
     before detection, so detection sees the edited content; apply_and_save
-    is then called without edits (already applied).
+    is then called without edits (already applied).  *cancel* propagates to
+    detection and masking (CLI does not use it — behaviour unchanged).
     """
     doc = open_document(input_path)
     try:
         if edits:
             apply_edits(doc, edits)
-        findings = detect(doc, opts, progress, **pinfo)
+        findings = detect(doc, opts, progress, cancel=cancel, **pinfo)
         out_path = output_path_for(input_path, opts)
         masked, pngs = apply_and_save(
-            doc, findings, opts, out_path, progress=progress, **pinfo
+            doc, findings, opts, out_path, progress=progress, cancel=cancel,
+            **pinfo
         )
         # Re-open the saved copy and confirm no complete RRN text remains.
         verify = {"residual": -1, "pages": []}   # -1 == verification failed

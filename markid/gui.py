@@ -29,11 +29,14 @@ from . import __version__
 from .edit import EditOp, apply_edits, chars_in_rect
 from .engine import (
     EncryptedPdfError,
+    OperationCancelled,
     Options,
     apply_and_save,
     detect,
+    extract_pages,
     open_document,
     output_path_for,
+    parse_page_ranges,
     run,
     save_edits_only,
     verify_result,
@@ -153,7 +156,9 @@ class MarkIDApp:
         self.edit_mode = False
         self._drag_start = None
         self._busy = False
-        self._pending_mask = False   # set when ② was pressed with no findings
+        self.undo_stack = []          # ("manual_add", id) / ("edit_add", id) /
+                                      # ("delete_finding", Finding) / ("delete_edit", EditOp)
+        self.cancel_event = threading.Event()
         self.msg_q = queue.Queue()
 
         self._build()
@@ -197,7 +202,7 @@ class MarkIDApp:
                   foreground=[("disabled", "#A0A6B0")],
                   bordercolor=[("active", NAVY), ("disabled", BORDER)])
 
-        # Primary (① / 수동 빠른 저장) - navy fill.
+        # Primary (검사/수동 저장 등 주요 실행) - navy fill.
         style.configure("Primary.TButton", font=FONT_BOLD, padding=(10, 3),
                         background=NAVY, foreground="#FFFFFF",
                         relief="flat", borderwidth=0)
@@ -206,8 +211,8 @@ class MarkIDApp:
                               ("disabled", "#9FB0C2")],
                   foreground=[("disabled", "#EAEFF4")])
 
-        # Strong (② 마스킹 저장) - deeper navy for emphasis.
-        style.configure("Strong.TButton", font=FONT_BOLD, padding=(10, 4),
+        # Strong (검출 항목 마스킹 저장) - deeper navy for emphasis.
+        style.configure("Strong.TButton", font=FONT_BOLD, padding=(10, 3),
                         background=NAVY_DARK, foreground="#FFFFFF",
                         relief="flat", borderwidth=0)
         style.map("Strong.TButton",
@@ -224,6 +229,29 @@ class MarkIDApp:
                               ("disabled", "#F5F7FA")],
                   foreground=[("disabled", "#A0A6B0")],
                   bordercolor=[("disabled", BORDER)])
+
+        # Compact primary / secondary (half-width action rows, 9pt bold).
+        style.configure("CompactPrimary.TButton", font=FONT_GROUP, padding=(6, 3),
+                        background=NAVY, foreground="#FFFFFF",
+                        relief="flat", borderwidth=0)
+        style.map("CompactPrimary.TButton",
+                  background=[("active", NAVY_HOVER), ("pressed", NAVY_DARK),
+                              ("disabled", "#9FB0C2")],
+                  foreground=[("disabled", "#EAEFF4")])
+        style.configure("CompactSecondary.TButton", font=FONT_GROUP, padding=(6, 3),
+                        background=CARD_BG, foreground=NAVY,
+                        relief="solid", borderwidth=1, bordercolor=NAVY)
+        style.map("CompactSecondary.TButton",
+                  background=[("active", HEAD_BG), ("pressed", "#E2E8F0"),
+                              ("disabled", "#F5F7FA")],
+                  foreground=[("disabled", "#A0A6B0")],
+                  bordercolor=[("disabled", BORDER)])
+        # Compact toggle (left-panel manual-mode button, on-state navy).
+        style.configure("CompactToggled.TButton", font=FONT_GROUP, padding=(4, 3),
+                        background=NAVY, foreground="#FFFFFF",
+                        relief="flat", borderwidth=0)
+        style.map("CompactToggled.TButton",
+                  background=[("active", NAVY_HOVER), ("pressed", NAVY_DARK)])
 
         # Toolbar default / toggled.
         style.configure("Tool.TButton", font=FONT, padding=(8, 5),
@@ -347,7 +375,7 @@ class MarkIDApp:
                      anchor="w").pack(fill="x", padx=8, pady=(3, 1))
         body = tk.Frame(shell, bg=CARD_BG)
         body.pack(fill="both", expand=True, padx=8,
-                  pady=(3 if not title else 0, 4))
+                  pady=(3 if not title else 0, 3))
         return body
 
     def _radio(self, parent, text, var, value):
@@ -427,13 +455,14 @@ class MarkIDApp:
         self._radio(sf, "모자이크", self.var_style,
                     "mosaic").pack(side="left", padx=(8, 0))
 
+        # OCR on/off moved to the two detect buttons (텍스트/사진 포함 검사).
         self.var_addr = tk.BooleanVar(value=False)
-        self.var_ocr = tk.BooleanVar(value=True)
+        self.var_png = tk.BooleanVar(value=False)
         cf = tk.Frame(g, bg=CARD_BG)
         cf.grid(row=3, column=0, columnspan=2, sticky="w", pady=(1, 0))
         self._check(cf, "주소도 마스킹", self.var_addr).pack(side="left")
-        self._check(cf, "이미지 OCR 검사 (신분증 사진 등)",
-                    self.var_ocr).pack(side="left", padx=(8, 0))
+        self._check(cf, "페이지 PNG로도 저장",
+                    self.var_png).pack(side="left", padx=(8, 0))
 
         glabel("출력 폴더", 4)
         of = tk.Frame(g, bg=CARD_BG)
@@ -444,59 +473,80 @@ class MarkIDApp:
         ttk.Button(of, text="찾아보기", style="Compact.TButton",
                    command=self._browse_outdir).pack(side="left", padx=(4, 0))
 
-        pf = tk.Frame(g, bg=CARD_BG)
-        pf.grid(row=5, column=0, columnspan=2, sticky="we")
-        tk.Label(pf, text="(비우면 원본 폴더\\masked)", bg=CARD_BG,
-                 fg=TEXT_SUB, font=FONT_SUB, anchor="w").pack(side="left")
-        self.var_png = tk.BooleanVar(value=False)
-        self._check(pf, "페이지 PNG로도 저장", self.var_png).pack(side="right")
+        tk.Label(g, text="(비우면 원본 폴더\\masked)", bg=CARD_BG,
+                 fg=TEXT_SUB, font=FONT_SUB, anchor="w").grid(
+                     row=5, column=1, sticky="w")
 
-        # -- 실행 (card title omitted: the three group rows label the card;
+        # -- 실행 (card title omitted: the group rows label the card;
         #    needed so the whole panel fits a 640px-high window) --
         c = self._card(parent, None)
-        # group 1: 자동 마스킹
-        self._grouprow(c, "자동 마스킹", "목록 없으면 검사 후 자동 진행")
-        self.btn_detect = ttk.Button(c, text="① 자동 검사 (검출 미리보기)",
-                                     style="Primary.TButton", command=self.on_detect)
-        self.btn_detect.pack(fill="x", pady=(1, 0))
-        self.btn_mask = ttk.Button(c, text="② 검출 항목 마스킹 저장",
+        # group 1: 자동 마스킹 — detect (text-only / with OCR), then mask.
+        self._grouprow(c, "자동 마스킹", "검사 후 체크된 항목을 마스킹")
+        dr = tk.Frame(c, bg=CARD_BG)
+        dr.pack(fill="x", pady=(1, 0))
+        self.btn_detect_text = ttk.Button(dr, text="텍스트 검사 (빠름)",
+                                          style="CompactPrimary.TButton",
+                                          command=lambda: self.on_detect(ocr=False))
+        self.btn_detect_text.pack(side="left", fill="x", expand=True)
+        self.btn_detect_ocr = ttk.Button(dr, text="사진 포함 검사 (OCR)",
+                                         style="CompactPrimary.TButton",
+                                         command=lambda: self.on_detect(ocr=True))
+        self.btn_detect_ocr.pack(side="left", fill="x", expand=True, padx=(5, 0))
+        self.btn_mask = ttk.Button(c, text="검출 항목 마스킹 저장",
                                    style="Strong.TButton", command=self.on_mask)
-        self.btn_mask.pack(fill="x", pady=(3, 0))
+        self.btn_mask.pack(fill="x", pady=(2, 0))
 
-        tk.Frame(c, bg=BORDER, height=1).pack(fill="x", pady=3)
+        tk.Frame(c, bg=BORDER, height=1).pack(fill="x", pady=2)
 
-        # group 2: 수동 마스킹 (빠름)
-        self._grouprow(c, "수동 마스킹 (빠름)", "드래그 지정 영역만 즉시 마스킹")
-        self.btn_mask_manual = ttk.Button(c, text="수동 영역만 바로 저장",
-                                          style="Primary.TButton",
+        # group 2: 수동 마스킹 — toggle (synced with toolbar) + quick save.
+        self._grouprow(c, "수동 마스킹", "검사 없이 지정한 영역만 즉시 마스킹")
+        mr = tk.Frame(c, bg=CARD_BG)
+        mr.pack(fill="x", pady=(1, 0))
+        self.btn_manual_panel = ttk.Button(mr, text="수동 영역 추가: 꺼짐",
+                                           style="Compact.TButton",
+                                           command=self.toggle_manual)
+        self.btn_manual_panel.pack(side="left", fill="x", expand=True)
+        self.btn_mask_manual = ttk.Button(mr, text="수동 영역만 저장",
+                                          style="CompactPrimary.TButton",
                                           command=self.on_mask_manual)
-        self.btn_mask_manual.pack(fill="x", pady=(1, 0))
+        self.btn_mask_manual.pack(side="left", fill="x", expand=True, padx=(5, 0))
 
-        tk.Frame(c, bg=BORDER, height=1).pack(fill="x", pady=3)
+        tk.Frame(c, bg=BORDER, height=1).pack(fill="x", pady=2)
 
-        # group 3: batch + utilities (self-describing, no group label)
-        self.btn_batch = ttk.Button(c, text="③ 전체 파일 일괄 처리",
-                                    style="Secondary.TButton", command=self.on_batch)
-        self.btn_batch.pack(fill="x")
-        util = tk.Frame(c, bg=CARD_BG)
-        util.pack(fill="x", pady=(3, 0))
-        self.btn_editsave = ttk.Button(util, text="수정만 저장 (마스킹 없음)",
+        # group 3: 기타 — batch (OCR fixed on), extract, edits-only, reset.
+        self._grouprow(c, "기타", "일괄 처리는 사진 포함 검사로 동작")
+        o1 = tk.Frame(c, bg=CARD_BG)
+        o1.pack(fill="x", pady=(1, 0))
+        self.btn_batch = ttk.Button(o1, text="전체 파일 일괄 처리",
+                                    style="CompactSecondary.TButton",
+                                    command=self.on_batch)
+        self.btn_batch.pack(side="left", fill="x", expand=True)
+        self.btn_extract = ttk.Button(o1, text="페이지 추출",
+                                      style="Compact.TButton",
+                                      command=self.on_extract)
+        self.btn_extract.pack(side="left", fill="x", expand=True, padx=(5, 0))
+        o2 = tk.Frame(c, bg=CARD_BG)
+        o2.pack(fill="x", pady=(2, 0))
+        self.btn_editsave = ttk.Button(o2, text="글자수정만 저장",
                                        style="Compact.TButton",
                                        command=self.on_save_edits)
         self.btn_editsave.pack(side="left", fill="x", expand=True)
-        self.btn_reset = ttk.Button(util, text="초기화 (파일 닫기)",
+        self.btn_reset = ttk.Button(o2, text="초기화 (파일 닫기)",
                                     style="Compact.TButton", command=self.on_reset)
         self.btn_reset.pack(side="left", fill="x", expand=True, padx=(5, 0))
 
         # -- 진행 상황 (progressbar shares the title row; log expands) --
         c = self._card(parent, None, expand=True)
         tr = tk.Frame(c, bg=CARD_BG)
-        tr.pack(fill="x", pady=(0, 3))
+        tr.pack(fill="x", pady=(0, 2))
         tk.Label(tr, text="진행 상황", bg=CARD_BG, fg=NAVY, font=FONT_BOLD,
                  anchor="w").pack(side="left")
         self.progress = ttk.Progressbar(tr, mode="determinate",
                                         style="Horizontal.TProgressbar")
         self.progress.pack(side="left", fill="x", expand=True, padx=(8, 0))
+        self.btn_stop = ttk.Button(tr, text="중지", style="Compact.TButton",
+                                   command=self.on_stop, state="disabled")
+        self.btn_stop.pack(side="left", padx=(5, 0))
         lf = tk.Frame(c, bg=CARD_BG)
         lf.pack(fill="both", expand=True)
         self.log = tk.Text(lf, height=4, font=FONT_LOG, wrap="word",
@@ -590,10 +640,22 @@ class MarkIDApp:
         self.canvas.bind("<B1-Motion>", self._on_canvas_drag)
         self.canvas.bind("<ButtonRelease-1>", self._on_canvas_release)
         self.canvas.bind("<Control-MouseWheel>", self._on_ctrl_wheel)
+        # Wheel scroll (canvas-local, so the findings tree keeps its own
+        # class binding untouched): plain = vertical, Shift = horizontal.
+        self.canvas.bind("<MouseWheel>", self._on_wheel_v)
+        self.canvas.bind("<Shift-MouseWheel>", self._on_wheel_h)
 
-        # -- findings table --
-        tk.Label(botf, text="검출 목록 (체크 해제 시 제외)", bg=APP_BG, fg=NAVY,
-                 font=FONT_BOLD, anchor="w").pack(fill="x", pady=(4, 2))
+        # -- findings table (header row hosts undo / delete controls) --
+        th = tk.Frame(botf, bg=APP_BG)
+        th.pack(fill="x", pady=(4, 2))
+        tk.Label(th, text="검출 목록 (체크 해제 시 제외)", bg=APP_BG, fg=NAVY,
+                 font=FONT_BOLD, anchor="w").pack(side="left")
+        self.btn_delsel = ttk.Button(th, text="선택 삭제", style="Compact.TButton",
+                                     command=self.on_delete_selected)
+        self.btn_delsel.pack(side="right")
+        self.btn_undo = ttk.Button(th, text="실행 취소", style="Compact.TButton",
+                                   command=self.on_undo)
+        self.btn_undo.pack(side="right", padx=(0, 5))
         tf = tk.Frame(botf, bg=APP_BG)
         tf.pack(fill="both", expand=True)
         cols = ("chk", "page", "kind", "text", "source")
@@ -611,17 +673,21 @@ class MarkIDApp:
         self.tree.config(yscrollcommand=tsb.set)
         self.tree.bind("<ButtonRelease-1>", self._on_tree_click)
         self.tree.bind("<Double-1>", self._on_tree_double)
+        self.tree.bind("<Delete>", lambda e: self.on_delete_selected())
 
     def _toolsep(self, parent):
         tk.Frame(parent, bg=BORDER, width=1, height=22).pack(
             side="left", fill="y", padx=6, pady=2)
 
     def _bind_shortcuts(self):
-        # PgUp/PgDn page nav, Ctrl+O add files. Ctrl+wheel zoom stays on canvas.
+        # PgUp/PgDn page nav, Ctrl+O add files, Ctrl+Z undo.
+        # (Ctrl+wheel zoom stays on the canvas.)
         self.root.bind("<Prior>", lambda e: self.change_page(-1))
         self.root.bind("<Next>", lambda e: self.change_page(1))
         self.root.bind("<Control-o>", lambda e: self.add_files())
         self.root.bind("<Control-O>", lambda e: self.add_files())
+        self.root.bind("<Control-z>", self.on_undo)
+        self.root.bind("<Control-Z>", self.on_undo)
 
     def _init_sash(self, _e=None):
         """Place the sash once at a 3:1 preview/list ratio."""
@@ -695,9 +761,13 @@ class MarkIDApp:
     def _set_busy(self, busy):
         self._busy = busy
         state = "disabled" if busy else "normal"
-        for b in (self.btn_detect, self.btn_mask, self.btn_mask_manual,
-                  self.btn_editsave, self.btn_batch, self.btn_reset):
+        for b in (self.btn_detect_text, self.btn_detect_ocr, self.btn_mask,
+                  self.btn_mask_manual, self.btn_batch, self.btn_extract,
+                  self.btn_editsave, self.btn_reset,
+                  self.btn_undo, self.btn_delsel):
             b.config(state=state)
+        # stop is the inverse: only usable while a worker is running
+        self.btn_stop.config(state="normal" if busy else "disabled")
 
     # --------------------------------------------------------- file list
     def add_files(self):
@@ -746,12 +816,14 @@ class MarkIDApp:
         return doc
 
     def _load_preview(self, path):
-        # Edits belong to one file: keep them when re-loading the same file
-        # (e.g. before every detection run), clear them on a file switch.
-        keep_edits = path == self.current_path
+        # Edits and manual regions belong to one file: keep them when
+        # re-loading the same file (e.g. before every detection run), clear
+        # them — and the undo stack — on a file switch.
+        keep_state = path == self.current_path
         self._close_docs()
-        if not keep_edits:
+        if not keep_state:
             self.edits = []
+            self.undo_stack = []
         try:
             self.work_doc = self._build_work_doc(path)
         except EncryptedPdfError as e:
@@ -765,12 +837,30 @@ class MarkIDApp:
         self.page_count = self.work_doc.page_count
         self.cur_page = 0
         self.preview_mode = "original"
-        self.findings = []
+        if keep_state:
+            # manual regions survive a re-detect; auto findings are refreshed
+            self.findings = [f for f in self.findings if f.kind == "manual"]
+        else:
+            self.findings = []
         self.result_doc = None
         self.result_path = None
         self.btn_toggle.config(state="disabled", text="결과 보기")
         self._refresh_tree()
         self.render_preview()
+
+    def _merge_findings(self, auto_findings):
+        """Merge fresh auto detections with preserved manual regions.
+
+        Manual findings keep their ids (the undo stack refers to them);
+        auto findings are re-numbered above the manual range.  De-duplication
+        applies to auto findings only (done inside detect()) — manual regions
+        are never dropped.
+        """
+        manual = [f for f in self.findings if f.kind == "manual"]
+        base = max([f.id for f in manual], default=-1) + 1
+        for i, f in enumerate(auto_findings):
+            f.id = base + i
+        return auto_findings + manual
 
     def _close_docs(self):
         for d in (self.work_doc, self.result_doc):
@@ -908,6 +998,14 @@ class MarkIDApp:
         self.change_zoom(ZOOM_STEP if e.delta > 0 else 1.0 / ZOOM_STEP)
         return "break"
 
+    def _on_wheel_v(self, e):
+        self.canvas.yview_scroll(-1 if e.delta > 0 else 1, "units")
+        return "break"
+
+    def _on_wheel_h(self, e):
+        self.canvas.xview_scroll(-1 if e.delta > 0 else 1, "units")
+        return "break"
+
     def change_page(self, delta):
         self.cur_page += delta
         self.render_preview()
@@ -920,23 +1018,39 @@ class MarkIDApp:
         self.render_preview()
 
     # --------------------------------------------------- drag modes (manual/edit)
+    def _ensure_original_view(self, why):
+        """Drag modes work on the original view: switch back if needed."""
+        if self.preview_mode == "result":
+            self.preview_mode = "original"
+            if self.result_doc is not None:
+                self.btn_toggle.config(text="결과 보기")
+            self.render_preview()
+            self.log_msg("%s은 원본 보기에서만 가능해 원본 보기로 전환했습니다." % why)
+
     def toggle_manual(self):
         self.manual_mode = not self.manual_mode
         if self.manual_mode:
             self.edit_mode = False
+            self._ensure_original_view("수동 영역 추가")
         self._update_mode_buttons()
 
     def toggle_edit(self):
         self.edit_mode = not self.edit_mode
         if self.edit_mode:
             self.manual_mode = False
+            self._ensure_original_view("글자 수정")
         self._update_mode_buttons()
 
     def _update_mode_buttons(self):
-        self.btn_manual.config(text="수동 영역 추가: %s" % ("켜짐" if self.manual_mode else "꺼짐"))
+        manual_text = "수동 영역 추가: %s" % ("켜짐" if self.manual_mode else "꺼짐")
+        self.btn_manual.config(text=manual_text)
         self.btn_edit.config(text="글자 수정: %s" % ("켜짐" if self.edit_mode else "꺼짐"))
         self._style_toggle(self.btn_manual, self.manual_mode)
         self._style_toggle(self.btn_edit, self.edit_mode)
+        # left-panel twin stays in sync (same state variable)
+        self.btn_manual_panel.config(
+            text=manual_text,
+            style="CompactToggled.TButton" if self.manual_mode else "Compact.TButton")
 
     def _on_canvas_press(self, e):
         if not (self.manual_mode or self.edit_mode):
@@ -971,6 +1085,7 @@ class MarkIDApp:
             self.findings.append(Finding(id=fid, page=self.cur_page, kind="manual",
                                          source="manual", text="수동 지정 영역",
                                          rect=(rx0, ry0, rx1, ry1)))
+            self.undo_stack.append(("manual_add", fid))
             self._refresh_tree()
             self.render_preview()
         else:
@@ -1042,9 +1157,86 @@ class MarkIDApp:
         self.edits.append(EditOp(id=eid, page=page, rect=tuple(rect),
                                  old_text=old_text, new_text=new_text,
                                  size=size, color=color))
+        self.undo_stack.append(("edit_add", eid))
         self.log_msg("글자수정 추가: %s → %s" % (_ell(old_text), _ell(new_text)))
         self._refresh_tree()
         self._rebuild_work_doc()
+
+    # ------------------------------------------------ undo / delete
+    def on_undo(self, _e=None):
+        """Ctrl+Z / [실행 취소]: revert the last manual-add, edit-add or delete."""
+        if self._busy:
+            return
+        w = self.root.focus_get()
+        if isinstance(w, (tk.Entry, ttk.Entry, tk.Text)) and w is not self.log:
+            return  # don't hijack text-field editing
+        if not self.undo_stack:
+            self.log_msg("취소할 작업이 없습니다")
+            return
+        kind, payload = self.undo_stack.pop()
+        if kind == "manual_add":
+            f = self._find_by_id(payload)
+            if f is not None:
+                self.findings.remove(f)
+            self.log_msg("실행 취소: 수동 영역 추가")
+            self._refresh_tree()
+            self.render_preview()
+        elif kind == "edit_add":
+            op = self._edit_by_id(payload)
+            if op is not None:
+                self.edits.remove(op)
+            self.log_msg("실행 취소: 글자수정 추가")
+            self._refresh_tree()
+            self._rebuild_work_doc()
+        elif kind == "delete_finding":
+            f = payload
+            if self._find_by_id(f.id) is not None:      # id clash after re-detect
+                f.id = max([x.id for x in self.findings], default=-1) + 1
+            self.findings.append(f)
+            self.log_msg("실행 취소: 검출 항목 삭제 복원")
+            self._refresh_tree()
+            self.render_preview()
+        elif kind == "delete_edit":
+            op = payload
+            if self._edit_by_id(op.id) is not None:
+                op.id = max([x.id for x in self.edits], default=-1) + 1
+            self.edits.append(op)
+            self.log_msg("실행 취소: 글자수정 삭제 복원")
+            self._refresh_tree()
+            self._rebuild_work_doc()
+
+    def on_delete_selected(self):
+        """[선택 삭제] / Delete key: remove the selected finding or edit."""
+        if self._busy:
+            return
+        sel = self.tree.selection()
+        if not sel:
+            self.log_msg("삭제할 항목을 목록에서 선택하세요.")
+            return
+        rebuild = False
+        removed = 0
+        for iid in sel:
+            if iid.startswith("e"):
+                op = self._edit_by_id(int(iid[1:]))
+                if op is not None:
+                    self.edits.remove(op)
+                    self.undo_stack.append(("delete_edit", op))
+                    rebuild = True
+                    removed += 1
+            else:
+                f = self._find_by_id(int(iid))
+                if f is not None:
+                    self.findings.remove(f)
+                    self.undo_stack.append(("delete_finding", f))
+                    removed += 1
+        if not removed:
+            return
+        self.log_msg("항목 %d건 삭제 (실행 취소 가능)" % removed)
+        self._refresh_tree()
+        if rebuild:
+            self._rebuild_work_doc()
+        else:
+            self.render_preview()
 
     # --------------------------------------------------------- tree
     def _refresh_tree(self):
@@ -1148,12 +1340,14 @@ class MarkIDApp:
             pass
 
     # --------------------------------------------------------- options
-    def _opts(self):
+    def _opts(self, ocr=True):
+        """Options snapshot; *ocr* comes from the pressed button (텍스트/사진),
+        not a checkbox.  Masking paths ignore the flag; batch fixes it True."""
         return Options(
             scope=self.var_scope.get(),
             style=self.var_style.get(),
             address=self.var_addr.get(),
-            ocr=self.var_ocr.get(),
+            ocr=ocr,
             png=self.var_png.get(),
             outdir=self.var_outdir.get().strip() or None,
         )
@@ -1193,9 +1387,16 @@ class MarkIDApp:
                 elif k == "mask_done":
                     self._on_mask_done(m["path"], m["count"], m.get("pngs", []), m.get("verify"))
                 elif k == "batch_done":
-                    self._on_batch_done(m["done"], m["masked"], m["total"])
+                    self._on_batch_done(m["done"], m["masked"], m["total"],
+                                        m.get("cancelled", False))
                 elif k == "editsave_done":
                     self._on_editsave_done(m["path"], m["count"], m.get("pngs", []))
+                elif k == "cancelled":
+                    self._set_busy(False)
+                    self.progress.stop()
+                    self.progress.config(mode="determinate", value=0)
+                    self._set_state("사용자 중지")
+                    self.log_msg("사용자 중지: %s이(가) 취소되었습니다" % m["op"])
                 elif k == "work_rebuilt":
                     old = self.work_doc
                     self.work_doc = m["doc"]
@@ -1208,7 +1409,6 @@ class MarkIDApp:
                     self.render_preview()
                     self.log_msg("편집 반영 완료")
                 elif k == "error":
-                    self._pending_mask = False
                     self._set_busy(False)
                     self.progress.stop()
                     self.progress.config(mode="determinate", value=0)
@@ -1220,25 +1420,26 @@ class MarkIDApp:
         self.root.after(100, self._poll_queue)
 
     # --------------------------------------------------------- detect
-    def on_detect(self):
+    def on_detect(self, ocr=True):
+        """[텍스트 검사 (빠름)] / [사진 포함 검사 (OCR)] — *ocr* per button."""
         if self._busy:
             return
         path = self._current_file()
         if not path:
-            self._pending_mask = False
             messagebox.showwarning("알림", "먼저 파일을 추가하세요.")
             return
-        self._load_preview(path)
+        self._load_preview(path)   # manual regions/edits survive (same file)
         if self.work_doc is None:
-            self._pending_mask = False
             return
-        opts = self._opts()
+        opts = self._opts(ocr=ocr)
         edits = list(self.edits)
+        self.cancel_event.clear()
         self._set_busy(True)
         self.progress.config(mode="indeterminate")
         self.progress.start(20)
-        self._set_state("검사 중")
-        self.log_msg("검사 시작: %s" % os.path.basename(path))
+        self._set_state("검사 중 (%s)" % ("사진 포함" if ocr else "텍스트"))
+        self.log_msg("%s 검사 시작: %s"
+                     % ("사진 포함" if ocr else "텍스트", os.path.basename(path)))
         threading.Thread(target=self._detect_worker, args=(path, opts, edits), daemon=True).start()
 
     def _detect_worker(self, path, opts, edits):
@@ -1246,17 +1447,21 @@ class MarkIDApp:
             # detection runs on the edited working copy (fresh open + edits)
             doc = self._build_work_doc(path, edits)
             try:
-                findings = detect(doc, opts, progress=self._progress_cb)
+                findings = detect(doc, opts, progress=self._progress_cb,
+                                  cancel=self.cancel_event)
             finally:
                 doc.close()
             self._post("detect_done", findings=findings)
+        except OperationCancelled:
+            self._post("cancelled", op="검사")
         except EncryptedPdfError as e:
             self._post("error", text=str(e))
         except Exception:  # noqa: BLE001
             self._post("error", text=traceback.format_exc().splitlines()[-1])
 
     def _on_detect_done(self, findings):
-        self.findings = findings
+        manual_kept = sum(1 for f in self.findings if f.kind == "manual")
+        self.findings = self._merge_findings(findings)
         self._set_busy(False)
         self.progress.stop()
         self.progress.config(mode="determinate", value=0)
@@ -1267,20 +1472,16 @@ class MarkIDApp:
         self.btn_overlay.config(text="표시 숨기기")
         self._style_toggle(self.btn_overlay, False)
         self.render_preview()
-        self.log_msg("검사 완료: %d건 검출" % len(findings))
-        self._set_state("검사 완료 · 검출 %d건" % len(findings))
-        # ② was pressed without findings: continue straight into masking.
-        if self._pending_mask:
-            self._pending_mask = False
-            path = self._current_file()
-            if not findings:
-                self.log_msg("검출된 항목이 없어 마스킹을 건너뜁니다.")
-                self._set_state("검출 없음")
-            elif path:
-                self._start_mask(path)
+        if manual_kept:
+            self.log_msg("검사 완료: 자동 %d건 검출 · 수동 %d건 유지"
+                         % (len(findings), manual_kept))
+        else:
+            self.log_msg("검사 완료: %d건 검출" % len(findings))
+        self._set_state("검사 완료 · 검출 %d건" % len(self.findings))
 
     # --------------------------------------------------------- mask
     def on_mask(self):
+        """[검출 항목 마스킹 저장] — masks the current list; never auto-detects."""
         if self._busy:
             return
         path = self._current_file()
@@ -1288,10 +1489,10 @@ class MarkIDApp:
             messagebox.showwarning("알림", "먼저 파일을 추가하세요.")
             return
         if not self.findings:
-            # detection runs first, then masking continues automatically.
-            self.log_msg("검출 목록이 없어 검사 후 자동으로 마스킹을 진행합니다.")
-            self._pending_mask = True
-            self.on_detect()
+            messagebox.showinfo(
+                "알림",
+                "검출 목록이 비어 있습니다.\n"
+                "먼저 자동 검사를 실행하거나 수동 영역을 추가하세요.")
             return
         self._start_mask(path)
 
@@ -1337,6 +1538,7 @@ class MarkIDApp:
         opts = self._opts()
         findings = self.findings if findings is None else findings
         edits = list(self.edits)
+        self.cancel_event.clear()
         self._set_busy(True)
         self.progress.config(mode="indeterminate")
         self.progress.start(20)
@@ -1348,10 +1550,14 @@ class MarkIDApp:
     def _mask_worker(self, path, opts, findings, edits):
         try:
             doc = open_document(path)
-            out_path = output_path_for(path, opts)
-            # apply_and_save applies the enabled edits first, then the masks
-            count, pngs = apply_and_save(doc, findings, opts, out_path,
-                                         edits=edits, progress=self._progress_cb)
+            try:
+                out_path = output_path_for(path, opts)
+                # apply_and_save applies the enabled edits first, then the masks
+                count, pngs = apply_and_save(doc, findings, opts, out_path,
+                                             edits=edits, progress=self._progress_cb,
+                                             cancel=self.cancel_event)
+            finally:
+                doc.close()
             # keep a fresh handle for result preview
             self._result_tmp = fitz.open(out_path)
             # re-verify the saved copy for residual complete RRN text
@@ -1360,7 +1566,8 @@ class MarkIDApp:
             except Exception:  # noqa: BLE001
                 verify = None
             self._post("mask_done", path=out_path, count=count, pngs=pngs, verify=verify)
-            doc.close()
+        except OperationCancelled:
+            self._post("cancelled", op="마스킹")
         except EncryptedPdfError as e:
             self._post("error", text=str(e))
         except Exception:  # noqa: BLE001
@@ -1418,8 +1625,8 @@ class MarkIDApp:
         self._set_busy(True)
         self.progress.config(mode="indeterminate")
         self.progress.start(20)
-        self._set_state("수정만 저장 중")
-        self.log_msg("수정만 저장 실행...")
+        self._set_state("글자수정만 저장 중")
+        self.log_msg("글자수정만 저장 실행...")
         threading.Thread(target=self._editsave_worker, args=(path, opts, edits),
                          daemon=True).start()
 
@@ -1442,7 +1649,7 @@ class MarkIDApp:
         self.btn_toggle.config(state="normal", text="원본 보기")
         self.preview_mode = "result"
         self.render_preview()
-        self._set_state("수정만 저장 완료")
+        self._set_state("글자수정만 저장 완료")
         self.log_msg("글자 수정 %d건 저장: %s" % (count, path))
         if pngs:
             self.log_msg("PNG %d장 저장" % len(pngs))
@@ -1450,33 +1657,40 @@ class MarkIDApp:
 
     # --------------------------------------------------------- batch
     def on_batch(self):
-        """③: process every file in the list with the current options."""
+        """[전체 파일 일괄 처리] — always detects with OCR (사진 포함 검사 고정)."""
         if self._busy:
             return
         if not self.files:
             messagebox.showwarning("알림", "먼저 파일을 추가하세요.")
             return
         self._release_result_doc()   # batch may overwrite the previewed output
-        opts = self._opts()
+        opts = self._opts(ocr=True)  # fixed: never skip images in batch mode
         files = list(self.files)
         edits_path = self.current_path      # edits belong to this file only
         edits = list(self.edits)
+        self.cancel_event.clear()
         self._set_busy(True)
         self.progress.config(mode="indeterminate")
         self.progress.start(20)
         self._set_state("일괄 처리 중")
-        self.log_msg("일괄 처리 시작: %d개 파일" % len(files))
+        self.log_msg("일괄 처리 시작: %d개 파일 (사진 포함 검사)" % len(files))
         threading.Thread(target=self._batch_worker, args=(files, opts, edits_path, edits),
                          daemon=True).start()
 
     def _batch_worker(self, files, opts, edits_path, edits):
         done = 0
         masked_total = 0
+        cancelled = False
         for i, path in enumerate(files):
             self._post("log", text="[%d/%d] %s" % (i + 1, len(files), os.path.basename(path)))
             try:
                 file_edits = edits if path == edits_path else None
-                rep = run(path, opts, progress=self._progress_cb, edits=file_edits)
+                rep = run(path, opts, progress=self._progress_cb, edits=file_edits,
+                          cancel=self.cancel_event)
+            except OperationCancelled:
+                self._post("log", text="  사용자 중지 — 남은 파일을 건너뜁니다")
+                cancelled = True
+                break
             except Exception as e:  # noqa: BLE001 - skip this file, keep going
                 self._post("log", text="  건너뜀(오류): %s" % e)
                 continue
@@ -1486,15 +1700,124 @@ class MarkIDApp:
             self._post("log", text="  검출 %d건 / 마스킹 %d건 / 재검증 잔여 %s건 -> %s"
                        % (len(rep["findings"]), rep["masked_count"],
                           v.get("residual", 0), rep["output"]))
-        self._post("batch_done", done=done, masked=masked_total, total=len(files))
+        self._post("batch_done", done=done, masked=masked_total, total=len(files),
+                   cancelled=cancelled)
 
-    def _on_batch_done(self, done, masked, total):
+    def _on_batch_done(self, done, masked, total, cancelled=False):
         self._set_busy(False)
         self.progress.stop()
         self.progress.config(mode="determinate", value=0)
+        if cancelled:
+            self._set_state("일괄 처리 중지")
+            self.log_msg("일괄 처리 중지: %d/%d개 파일 처리됨, %d건 마스킹"
+                         % (done, total, masked))
+            messagebox.showwarning("중지", "일괄 처리를 중지했습니다.\n%d/%d개 파일 처리, %d건 마스킹"
+                                   % (done, total, masked))
+            return
         self._set_state("일괄 처리 완료")
         self.log_msg("일괄 처리 완료: %d/%d개 파일, %d건 마스킹" % (done, total, masked))
         messagebox.showinfo("완료", "%d개 파일 완료, %d건 마스킹" % (done, masked))
+
+    # --------------------------------------------------------- stop
+    def on_stop(self):
+        """[중지] — request cancellation at the next page / OCR-pass boundary."""
+        if not self._busy:
+            return
+        self.cancel_event.set()
+        self.btn_stop.config(state="disabled")
+        self.log_msg("중지 요청... 페이지/검사 단계 경계에서 멈춥니다")
+        self._set_state("중지 요청됨")
+
+    # --------------------------------------------------- page extraction
+    def on_extract(self):
+        """[페이지 추출] — save selected pages of the current view as a PDF."""
+        if self._busy:
+            return
+        doc = self._active_doc()
+        if doc is None or self.page_count == 0:
+            messagebox.showwarning("알림", "먼저 파일을 열어 주세요.")
+            return
+        dlg = self._build_extract_dialog()
+        try:
+            rx, ry = self.root.winfo_rootx(), self.root.winfo_rooty()
+            rw, rh = self.root.winfo_width(), self.root.winfo_height()
+            dlg.update_idletasks()
+            w, h = dlg.winfo_reqwidth(), dlg.winfo_reqheight()
+            dlg.geometry("+%d+%d" % (rx + (rw - w) // 2, ry + (rh - h) // 3))
+        except Exception:
+            pass
+        dlg.grab_set()
+        dlg.focus_set()
+
+    def _build_extract_dialog(self):
+        """Construct the extraction dialog (no grab — selftest builds it too)."""
+        doc = self._active_doc()
+        total = doc.page_count if doc is not None else 0
+        target = ("결과(마스킹본)"
+                  if self.preview_mode == "result" and self.result_doc is not None
+                  else "원본(글자수정 반영)")
+
+        dlg = tk.Toplevel(self.root)
+        dlg.title("페이지 추출")
+        dlg.transient(self.root)
+        dlg.resizable(False, False)
+        dlg.configure(bg=CARD_BG)
+        frm = tk.Frame(dlg, bg=CARD_BG)
+        frm.pack(fill="both", expand=True, padx=16, pady=14)
+
+        tk.Label(frm, text="대상 문서: 현재 보기 — %s" % target, bg=CARD_BG,
+                 fg=NAVY, font=FONT_BOLD, anchor="w").pack(fill="x")
+        tk.Label(frm, text="추출할 페이지 (형식: 1,3-5,7 · 전체 %d페이지)" % total,
+                 bg=CARD_BG, fg=TEXT_SUB, font=FONT_SUB,
+                 anchor="w").pack(fill="x", pady=(6, 2))
+
+        row = tk.Frame(frm, bg=CARD_BG)
+        row.pack(fill="x")
+        var = tk.StringVar(value=str(self.cur_page + 1) if total else "")
+        ent = ttk.Entry(row, textvariable=var, width=24)
+        ent.pack(side="left", fill="x", expand=True)
+        ttk.Button(row, text="현재 페이지", style="Compact.TButton",
+                   command=lambda: var.set(str(self.cur_page + 1))
+                   ).pack(side="left", padx=(6, 0))
+        ent.focus_set()
+        ent.selection_range(0, "end")
+
+        def on_save():
+            try:
+                pages = parse_page_ranges(var.get(), total)
+            except ValueError as ex:
+                messagebox.showerror("오류", str(ex), parent=dlg)
+                return
+            base = os.path.splitext(
+                os.path.basename(self.current_path or "output"))[0]
+            safe = "".join(ch for ch in var.get() if ch in "0123456789,-")
+            path = filedialog.asksaveasfilename(
+                parent=dlg, title="페이지 추출 저장",
+                defaultextension=".pdf", filetypes=[("PDF", "*.pdf")],
+                initialfile="%s_p%s.pdf" % (base, safe or "pages"))
+            if not path:
+                return
+            try:
+                newdoc = extract_pages(doc, pages)
+                try:
+                    newdoc.save(path, garbage=3, deflate=True)
+                finally:
+                    newdoc.close()
+            except Exception as ex:  # noqa: BLE001
+                messagebox.showerror("오류", "페이지 추출 실패: %s" % ex, parent=dlg)
+                return
+            dlg.destroy()
+            self.log_msg("페이지 추출: %d페이지 → %s" % (len(pages), path))
+            self._set_state("페이지 추출 완료")
+
+        btns = tk.Frame(frm, bg=CARD_BG)
+        btns.pack(anchor="e", pady=(12, 0))
+        ttk.Button(btns, text="저장", style="Primary.TButton",
+                   command=on_save).pack(side="left", padx=(0, 5))
+        ttk.Button(btns, text="취소", command=dlg.destroy).pack(side="left")
+        ent.bind("<Return>", lambda _e: on_save())
+        dlg.bind("<Escape>", lambda _e: dlg.destroy())
+        return dlg
 
     # --------------------------------------------------------- reset
     def on_reset(self):
@@ -1518,7 +1841,7 @@ class MarkIDApp:
         self.preview_mode = "original"
         self.zoom = 1.0
         self.tkimg = None
-        self._pending_mask = False
+        self.undo_stack = []
         self._refresh_tree()
         self.canvas.delete("all")
         self.lbl_page.config(text="- / -")
@@ -1558,12 +1881,24 @@ def selftest():
         app.render_preview()
         app._refresh_tree()
         app._refresh_status()
-        # new widgets / entry points must exist
+        # v1.4 widgets / entry points must exist
         assert hasattr(app, "hdr"), "header bar missing"
         assert hasattr(app, "sb_file") and hasattr(app, "sb_page") \
             and hasattr(app, "sb_status"), "status bar missing"
-        assert hasattr(app, "btn_mask_manual"), "manual quick-mask button missing"
-        assert callable(getattr(app, "show_info", None)), "info dialog builder missing"
-        assert callable(getattr(app, "on_mask_manual", None)), "manual mask handler missing"
+        for name in ("btn_detect_text", "btn_detect_ocr", "btn_mask",
+                     "btn_manual_panel", "btn_mask_manual", "btn_batch",
+                     "btn_extract", "btn_editsave", "btn_reset",
+                     "btn_stop", "btn_undo", "btn_delsel"):
+            assert hasattr(app, name), "%s missing" % name
+        assert str(app.btn_stop["state"]) == "disabled", "stop must start disabled"
+        for name in ("show_info", "on_mask_manual", "on_stop", "on_undo",
+                     "on_delete_selected", "on_extract"):
+            assert callable(getattr(app, name, None)), "%s handler missing" % name
+        assert hasattr(app, "cancel_event"), "cancel event missing"
+        # extraction dialog must construct without a document
+        dlg = app._build_extract_dialog()
+        dlg.destroy()
+        # undo on empty stack must be a safe no-op (logs a notice)
+        app.on_undo()
     finally:
         root.destroy()

@@ -277,7 +277,8 @@ CLIP_MAX_FRAC = 0.70        # clip union above this page fraction -> full page
 
 
 def detect_page_ocr(page, page_index, image_rects, address_on,
-                    dpi_upright=DPI_UPRIGHT, dpi_rotated=DPI_ROTATED, progress=None):
+                    dpi_upright=DPI_UPRIGHT, dpi_rotated=DPI_ROTATED,
+                    progress=None, cancel=None):
     """Run all OCR passes for a page and return findings.
 
     - 0 degree pass: whole page, always.
@@ -285,6 +286,10 @@ def detect_page_ocr(page, page_index, image_rects, address_on,
       rect +- CLIP_MARGIN_PT (clamped to the page).  When the clip union
       exceeds CLIP_MAX_FRAC of the page area the old full-page rotated
       passes are used instead (clipping would not save anything).
+
+    *cancel* (optional ``threading.Event``) is checked before each pass;
+    when set, ``markid.engine.OperationCancelled`` is raised (a single
+    RapidOCR call cannot be interrupted mid-flight).
     """
     passes = [(0, dpi_upright, None)]
     if image_rects:
@@ -308,6 +313,11 @@ def detect_page_ocr(page, page_index, image_rects, address_on,
 
     out = []
     for idx, (k, dpi, clip) in enumerate(passes):
+        if cancel is not None and cancel.is_set():
+            # Lazy import: engine imports this module at load time, so the
+            # exception class must be resolved at call time instead.
+            from .engine import OperationCancelled
+            raise OperationCancelled()
         if progress:
             progress(stage="ocr", page=page_index, sub=idx, total=len(passes))
         out += _run_pass(page, page_index, k, dpi, image_rects, address_on,
