@@ -41,7 +41,7 @@ from .engine import (
     save_edits_only,
     verify_result,
 )
-from .findings import KIND_LABEL_KO, SOURCE_LABEL_KO, Finding
+from .findings import KIND_LABEL_KO, SOURCE_LABEL_KO, Finding, contains, iou
 
 # --------------------------------------------------------------------------
 # Design tokens
@@ -156,8 +156,12 @@ class MarkIDApp:
         self.edit_mode = False
         self._drag_start = None
         self._busy = False
+        self.sel_id = None            # selected finding id (box editing, v1.5)
+        self._box_drag = None         # in-progress move/resize of the selection
+        self._box_prev_item = None    # live drag preview canvas item
         self.undo_stack = []          # ("manual_add", id) / ("edit_add", id) /
-                                      # ("delete_finding", Finding) / ("delete_edit", EditOp)
+                                      # ("delete_finding", Finding) / ("delete_edit", EditOp) /
+                                      # ("adjust", (id, old_rect, old_back6, old_flag))
         self.cancel_event = threading.Event()
         self.msg_q = queue.Queue()
 
@@ -644,6 +648,9 @@ class MarkIDApp:
         # class binding untouched): plain = vertical, Shift = horizontal.
         self.canvas.bind("<MouseWheel>", self._on_wheel_v)
         self.canvas.bind("<Shift-MouseWheel>", self._on_wheel_h)
+        # box editing (v1.5): hover cursor + right-click context menu
+        self.canvas.bind("<Motion>", self._on_canvas_motion)
+        self.canvas.bind("<Button-3>", self._on_canvas_rclick)
 
         # -- findings table (header row hosts undo / delete controls) --
         th = tk.Frame(botf, bg=APP_BG)
@@ -674,6 +681,7 @@ class MarkIDApp:
         self.tree.bind("<ButtonRelease-1>", self._on_tree_click)
         self.tree.bind("<Double-1>", self._on_tree_double)
         self.tree.bind("<Delete>", lambda e: self.on_delete_selected())
+        self.tree.bind("<<TreeviewSelect>>", self._on_tree_select)
 
     def _toolsep(self, parent):
         tk.Frame(parent, bg=BORDER, width=1, height=22).pack(
@@ -837,9 +845,12 @@ class MarkIDApp:
         self.page_count = self.work_doc.page_count
         self.cur_page = 0
         self.preview_mode = "original"
+        self.sel_id = None
         if keep_state:
-            # manual regions survive a re-detect; auto findings are refreshed
-            self.findings = [f for f in self.findings if f.kind == "manual"]
+            # manual regions and user-adjusted boxes survive a re-detect;
+            # auto findings are refreshed
+            self.findings = [f for f in self.findings
+                             if f.kind == "manual" or f.user_adjusted]
         else:
             self.findings = []
         self.result_doc = None
@@ -849,18 +860,29 @@ class MarkIDApp:
         self.render_preview()
 
     def _merge_findings(self, auto_findings):
-        """Merge fresh auto detections with preserved manual regions.
+        """Merge fresh auto detections with preserved manual/adjusted boxes.
 
-        Manual findings keep their ids (the undo stack refers to them);
-        auto findings are re-numbered above the manual range.  De-duplication
-        applies to auto findings only (done inside detect()) — manual regions
-        are never dropped.
+        Preserved findings (manual regions and user-adjusted boxes) keep
+        their ids (the undo stack refers to them); auto findings are
+        re-numbered above that range.  A fresh auto hit that lands on a
+        user-adjusted box of the same kind is dropped — the box the user
+        tuned wins over the re-detected one.
         """
-        manual = [f for f in self.findings if f.kind == "manual"]
-        base = max([f.id for f in manual], default=-1) + 1
-        for i, f in enumerate(auto_findings):
+        keep = [f for f in self.findings if f.kind == "manual" or f.user_adjusted]
+        adjusted = [k for k in keep if k.user_adjusted]
+        autos = []
+        for f in auto_findings:
+            clash = any(
+                k.kind == f.kind and k.page == f.page
+                and (iou(k.rect, f.rect) >= 0.4
+                     or contains(k.rect, f.rect) or contains(f.rect, k.rect))
+                for k in adjusted)
+            if not clash:
+                autos.append(f)
+        base = max([f.id for f in keep], default=-1) + 1
+        for i, f in enumerate(autos):
             f.id = base + i
-        return auto_findings + manual
+        return autos + keep
 
     def _close_docs(self):
         for d in (self.work_doc, self.result_doc):
@@ -984,6 +1006,14 @@ class MarkIDApp:
             else:
                 self.canvas.create_rectangle(x0, y0, x1, y1, outline=COLOR["edit"],
                                              width=2)
+        # selection emphasis: thick border + 8 resize handles (v1.5)
+        f = self._find_by_id(self.sel_id) if self.sel_id is not None else None
+        if f is not None and f.page == self.cur_page:
+            sr = tuple(v * self.scale for v in f.rect)
+            self.canvas.create_rectangle(*sr, outline=NAVY, width=3)
+            for hx, hy in self._handle_points(sr).values():
+                self.canvas.create_rectangle(hx - 3, hy - 3, hx + 3, hy + 3,
+                                             fill=NAVY, outline="#FFFFFF")
 
     # --------------------------------------------------------- zoom
     def change_zoom(self, factor):
@@ -1008,6 +1038,8 @@ class MarkIDApp:
 
     def change_page(self, delta):
         self.cur_page += delta
+        self.sel_id = None            # selection is per page view
+        self._box_drag = None
         self.render_preview()
 
     def toggle_preview(self):
@@ -1031,6 +1063,7 @@ class MarkIDApp:
         self.manual_mode = not self.manual_mode
         if self.manual_mode:
             self.edit_mode = False
+            self._select_finding(None)     # drag modes take over the canvas
             self._ensure_original_view("수동 영역 추가")
         self._update_mode_buttons()
 
@@ -1038,6 +1071,7 @@ class MarkIDApp:
         self.edit_mode = not self.edit_mode
         if self.edit_mode:
             self.manual_mode = False
+            self._select_finding(None)
             self._ensure_original_view("글자 수정")
         self._update_mode_buttons()
 
@@ -1053,15 +1087,55 @@ class MarkIDApp:
             style="CompactToggled.TButton" if self.manual_mode else "Compact.TButton")
 
     def _on_canvas_press(self, e):
-        if not (self.manual_mode or self.edit_mode):
+        if self.manual_mode or self.edit_mode:
+            self._drag_start = (self.canvas.canvasx(e.x), self.canvas.canvasy(e.y))
+            color = COLOR["edit"] if self.edit_mode else COLOR["manual"]
+            self._drag_rect = self.canvas.create_rectangle(
+                self._drag_start[0], self._drag_start[1], self._drag_start[0], self._drag_start[1],
+                outline=color, width=2)
             return
-        self._drag_start = (self.canvas.canvasx(e.x), self.canvas.canvasy(e.y))
-        color = COLOR["edit"] if self.edit_mode else COLOR["manual"]
-        self._drag_rect = self.canvas.create_rectangle(
-            self._drag_start[0], self._drag_start[1], self._drag_start[0], self._drag_start[1],
-            outline=color, width=2)
+        # --- box selection / adjustment (idle, original view only) ---
+        if self._busy or self.preview_mode != "original" or self.work_doc is None:
+            return
+        cx = self.canvas.canvasx(e.x)
+        cy = self.canvas.canvasy(e.y)
+        f = self._find_by_id(self.sel_id) if self.sel_id is not None else None
+        if f is not None and f.page == self.cur_page:
+            sr = tuple(v * self.scale for v in f.rect)
+            handle = self._handle_at(sr, cx, cy)
+            if handle is not None:
+                self._box_drag = {"mode": handle, "start": (cx, cy),
+                                  "orig": tuple(f.rect), "moved": False}
+                return
+            if sr[0] <= cx <= sr[2] and sr[1] <= cy <= sr[3]:
+                self._box_drag = {"mode": "move", "start": (cx, cy),
+                                  "orig": tuple(f.rect), "moved": False}
+                return
+        hit = self._finding_at(cx / self.scale, cy / self.scale)
+        if hit is not None:
+            self._select_finding(hit.id)
+            # arm an immediate move so click-and-drag works in one gesture
+            self._box_drag = {"mode": "move", "start": (cx, cy),
+                              "orig": tuple(hit.rect), "moved": False}
+        else:
+            self._select_finding(None)
 
     def _on_canvas_drag(self, e):
+        if self._box_drag is not None:
+            cx = self.canvas.canvasx(e.x)
+            cy = self.canvas.canvasy(e.y)
+            d = self._box_drag
+            if abs(cx - d["start"][0]) + abs(cy - d["start"][1]) > 3:
+                d["moved"] = True
+            if not d["moved"]:
+                return
+            nr = self._adjusted_rect(cx, cy)
+            if self._box_prev_item is not None:
+                self.canvas.delete(self._box_prev_item)
+            sr = tuple(v * self.scale for v in nr)
+            self._box_prev_item = self.canvas.create_rectangle(
+                *sr, outline=NAVY, width=2, dash=(4, 2))
+            return
         if not (self.manual_mode or self.edit_mode) or self._drag_start is None:
             return
         x = self.canvas.canvasx(e.x)
@@ -1069,6 +1143,33 @@ class MarkIDApp:
         self.canvas.coords(self._drag_rect, self._drag_start[0], self._drag_start[1], x, y)
 
     def _on_canvas_release(self, e):
+        if self._box_drag is not None:
+            cx = self.canvas.canvasx(e.x)
+            cy = self.canvas.canvasy(e.y)
+            d = self._box_drag
+            nr = self._adjusted_rect(cx, cy)
+            self._box_drag = None
+            if self._box_prev_item is not None:
+                self.canvas.delete(self._box_prev_item)
+                self._box_prev_item = None
+            if not d["moved"]:
+                self.render_preview()      # plain click: selection only
+                return
+            f = self._find_by_id(self.sel_id)
+            if f is None:
+                self.render_preview()
+                return
+            self.undo_stack.append(("adjust", (f.id, tuple(f.rect),
+                                               f.rect_back6, f.user_adjusted)))
+            f.rect = nr
+            f.rect_back6 = None            # user intent overrides the estimate
+            f.user_adjusted = True
+            self.log_msg("박스 조정 (실행 취소 가능)")
+            self._refresh_tree()
+            if self.tree.exists(str(f.id)):
+                self.tree.selection_set(str(f.id))
+            self.render_preview()
+            return
         if not (self.manual_mode or self.edit_mode) or self._drag_start is None:
             return
         x0, y0 = self._drag_start
@@ -1090,6 +1191,196 @@ class MarkIDApp:
             self.render_preview()
         else:
             self._edit_from_rect((rx0, ry0, rx1, ry1))
+
+    # ----------------------------------------- box selection / adjustment
+    _HANDLE_CURSOR = {"nw": "size_nw_se", "se": "size_nw_se",
+                      "ne": "size_ne_sw", "sw": "size_ne_sw",
+                      "n": "size_ns", "s": "size_ns",
+                      "e": "size_we", "w": "size_we"}
+
+    @staticmethod
+    def _handle_points(sr):
+        """8 handle centres (canvas px) of a scaled rect: corners + edges."""
+        x0, y0, x1, y1 = sr
+        mx, my = (x0 + x1) / 2.0, (y0 + y1) / 2.0
+        return {"nw": (x0, y0), "n": (mx, y0), "ne": (x1, y0),
+                "e": (x1, my), "se": (x1, y1), "s": (mx, y1),
+                "sw": (x0, y1), "w": (x0, my)}
+
+    def _handle_at(self, sr, cx, cy, r=5):
+        """Handle key under canvas point (cx, cy), or None."""
+        for key, (hx, hy) in self._handle_points(sr).items():
+            if abs(cx - hx) <= r and abs(cy - hy) <= r:
+                return key
+        return None
+
+    def _finding_at(self, px, py):
+        """Smallest-area finding under page point (px, py) on this page."""
+        best = None
+        best_area = None
+        for f in self.findings:
+            if f.page != self.cur_page:
+                continue
+            x0, y0, x1, y1 = f.rect
+            if x0 <= px <= x1 and y0 <= py <= y1:
+                area = (x1 - x0) * (y1 - y0)
+                if best_area is None or area < best_area:
+                    best, best_area = f, area
+        return best
+
+    def _edit_at(self, px, py):
+        """Smallest-area EditOp under page point (px, py) on this page."""
+        best = None
+        best_area = None
+        for op in self.edits:
+            if op.page != self.cur_page:
+                continue
+            x0, y0, x1, y1 = op.rect
+            if x0 <= px <= x1 and y0 <= py <= y1:
+                area = (x1 - x0) * (y1 - y0)
+                if best_area is None or area < best_area:
+                    best, best_area = op, area
+        return best
+
+    def _select_finding(self, fid):
+        """Set the canvas selection and mirror it into the findings tree."""
+        if fid == self.sel_id and fid is None:
+            return
+        self.sel_id = fid
+        if fid is not None:
+            iid = str(fid)
+            if self.tree.exists(iid):
+                self.tree.selection_set(iid)
+                self.tree.see(iid)
+        elif self.tree.selection():
+            self.tree.selection_remove(*self.tree.selection())
+        self.render_preview()
+
+    def _on_tree_select(self, _e=None):
+        """Tree row selection mirrors into the canvas box highlight."""
+        sel = self.tree.selection()
+        fid = None
+        if sel and not sel[0].startswith("e"):
+            try:
+                fid = int(sel[0])
+            except ValueError:
+                fid = None
+        if fid == self.sel_id:
+            return
+        self.sel_id = fid
+        if self.preview_mode == "original":
+            self.render_preview()
+
+    def _adjusted_rect(self, cx, cy):
+        """Rect (display pts) for the in-progress move/resize at (cx, cy).
+
+        Enforces a 4x4pt minimum and clamps to the page (display) bounds.
+        """
+        d = self._box_drag
+        ox0, oy0, ox1, oy1 = d["orig"]
+        dx = (cx - d["start"][0]) / self.scale
+        dy = (cy - d["start"][1]) / self.scale
+        page = self.work_doc[self.cur_page]
+        pw, ph = page.rect.width, page.rect.height
+        m = d["mode"]
+        if m == "move":
+            w, h = ox1 - ox0, oy1 - oy0
+            nx0 = min(max(ox0 + dx, 0.0), max(0.0, pw - w))
+            ny0 = min(max(oy0 + dy, 0.0), max(0.0, ph - h))
+            return (nx0, ny0, nx0 + w, ny0 + h)
+        x0, y0, x1, y1 = ox0, oy0, ox1, oy1
+        if "w" in m:
+            x0 = min(max(0.0, ox0 + dx), x1 - 4.0)
+        if "e" in m:
+            x1 = max(min(pw, ox1 + dx), x0 + 4.0)
+        if "n" in m:
+            y0 = min(max(0.0, oy0 + dy), y1 - 4.0)
+        if "s" in m:
+            y1 = max(min(ph, oy1 + dy), y0 + 4.0)
+        return (x0, y0, x1, y1)
+
+    def _on_canvas_motion(self, e):
+        """Cursor feedback over the selected box (idle mode only)."""
+        if (self._busy or self.manual_mode or self.edit_mode
+                or self.preview_mode != "original" or self._box_drag is not None):
+            return
+        cur = ""
+        f = self._find_by_id(self.sel_id) if self.sel_id is not None else None
+        if f is not None and f.page == self.cur_page:
+            cx = self.canvas.canvasx(e.x)
+            cy = self.canvas.canvasy(e.y)
+            sr = tuple(v * self.scale for v in f.rect)
+            h = self._handle_at(sr, cx, cy)
+            if h is not None:
+                cur = self._HANDLE_CURSOR[h]
+            elif sr[0] <= cx <= sr[2] and sr[1] <= cy <= sr[3]:
+                cur = "fleur"
+        try:
+            self.canvas.config(cursor=cur)
+        except Exception:
+            pass
+
+    def _toggle_enabled(self, iid):
+        """Flip the enabled state of a finding/edit row (tree + context menu)."""
+        if iid.startswith("e"):
+            op = self._edit_by_id(int(iid[1:]))
+            if op is None:
+                return
+            op.enabled = not op.enabled
+            self.tree.set(iid, "chk", CHECK_ON if op.enabled else CHECK_OFF)
+            self._retag_row(iid, op.enabled)
+            self._rebuild_work_doc()   # revert/apply in the working copy
+            return
+        f = self._find_by_id(int(iid))
+        if f is not None:
+            f.enabled = not f.enabled
+            self.tree.set(iid, "chk", CHECK_ON if f.enabled else CHECK_OFF)
+            self._retag_row(iid, f.enabled)
+            if self.preview_mode == "original":
+                self.render_preview()
+
+    def _build_box_menu(self, iid):
+        """Context menu for a box: 삭제 / 체크 토글 (selftest builds it too)."""
+        if iid.startswith("e"):
+            op = self._edit_by_id(int(iid[1:]))
+            enabled = op.enabled if op is not None else True
+        else:
+            f = self._find_by_id(int(iid))
+            enabled = f.enabled if f is not None else True
+
+        menu = tk.Menu(self.root, tearoff=0, font=FONT)
+
+        def do_delete():
+            if self.tree.exists(iid):
+                self.tree.selection_set(iid)
+                self.on_delete_selected()
+
+        menu.add_command(label="삭제", command=do_delete)
+        menu.add_command(label=("체크 해제" if enabled else "체크"),
+                         command=lambda: self._toggle_enabled(iid))
+        return menu
+
+    def _on_canvas_rclick(self, e):
+        """Right-click on a box: context menu (delete / toggle check)."""
+        if (self._busy or self.preview_mode != "original"
+                or self.work_doc is None or self.manual_mode or self.edit_mode):
+            return
+        px = self.canvas.canvasx(e.x) / self.scale
+        py = self.canvas.canvasy(e.y) / self.scale
+        f = self._finding_at(px, py)
+        if f is not None:
+            self._select_finding(f.id)
+            iid = str(f.id)
+        else:
+            op = self._edit_at(px, py)
+            if op is None:
+                return                     # empty area: no menu
+            iid = "e%d" % op.id
+        menu = self._build_box_menu(iid)
+        try:
+            menu.tk_popup(e.x_root, e.y_root)
+        finally:
+            menu.grab_release()
 
     # --------------------------------------------------------- text edit
     def _edit_from_rect(self, rect):
@@ -1204,6 +1495,16 @@ class MarkIDApp:
             self.log_msg("실행 취소: 글자수정 삭제 복원")
             self._refresh_tree()
             self._rebuild_work_doc()
+        elif kind == "adjust":
+            fid, old_rect, old_b6, old_flag = payload
+            f = self._find_by_id(fid)
+            if f is not None:
+                f.rect = old_rect
+                f.rect_back6 = old_b6
+                f.user_adjusted = old_flag
+            self.log_msg("실행 취소: 박스 조정 복원")
+            self._refresh_tree()
+            self.render_preview()
 
     def on_delete_selected(self):
         """[선택 삭제] / Delete key: remove the selected finding or edit."""
@@ -1228,6 +1529,8 @@ class MarkIDApp:
                 if f is not None:
                     self.findings.remove(f)
                     self.undo_stack.append(("delete_finding", f))
+                    if self.sel_id == f.id:
+                        self.sel_id = None
                     removed += 1
         if not removed:
             return
@@ -1248,12 +1551,15 @@ class MarkIDApp:
                 tags.append("odd")
             if not f.enabled:
                 tags.append("off")
+            src = SOURCE_LABEL_KO.get(f.source, f.source)
+            if f.user_adjusted:
+                src += "(조정)"
             self.tree.insert("", "end", iid=str(f.id), tags=tuple(tags), values=(
                 CHECK_ON if f.enabled else CHECK_OFF,
                 f.page + 1,
                 KIND_LABEL_KO.get(f.kind, f.kind),
                 f.text,
-                SOURCE_LABEL_KO.get(f.source, f.source),
+                src,
             ))
             row += 1
         for e in self.edits:
@@ -1292,21 +1598,7 @@ class MarkIDApp:
         col = self.tree.identify_column(e.x)
         if col != "#1":  # checkbox column only
             return
-        if row.startswith("e"):
-            op = self._edit_by_id(int(row[1:]))
-            if op is not None:
-                op.enabled = not op.enabled
-                self.tree.set(row, "chk", CHECK_ON if op.enabled else CHECK_OFF)
-                self._retag_row(row, op.enabled)
-                self._rebuild_work_doc()   # revert/apply in the working copy
-            return
-        f = self._find_by_id(int(row))
-        if f is not None:
-            f.enabled = not f.enabled
-            self.tree.set(row, "chk", CHECK_ON if f.enabled else CHECK_OFF)
-            self._retag_row(row, f.enabled)
-            if self.preview_mode == "original":
-                self.render_preview()
+        self._toggle_enabled(row)
 
     def _retag_row(self, row, enabled):
         tags = [t for t in self.tree.item(row, "tags") if t != "off"]
@@ -1842,6 +2134,8 @@ class MarkIDApp:
         self.zoom = 1.0
         self.tkimg = None
         self.undo_stack = []
+        self.sel_id = None
+        self._box_drag = None
         self._refresh_tree()
         self.canvas.delete("all")
         self.lbl_page.config(text="- / -")
@@ -1895,6 +2189,20 @@ def selftest():
                      "on_delete_selected", "on_extract"):
             assert callable(getattr(app, name, None)), "%s handler missing" % name
         assert hasattr(app, "cancel_event"), "cancel event missing"
+        # v1.5 box editing: selection state + helpers + context menu path
+        assert app.sel_id is None and app._box_drag is None, "selection must start empty"
+        for name in ("_finding_at", "_edit_at", "_handle_at", "_handle_points",
+                     "_adjusted_rect", "_select_finding", "_toggle_enabled",
+                     "_build_box_menu", "_on_canvas_rclick", "_on_canvas_motion"):
+            assert callable(getattr(app, name, None)), "%s helper missing" % name
+        app.findings.append(Finding(id=0, page=0, kind="manual", source="manual",
+                                    text="검사용", rect=(10, 10, 60, 30)))
+        app._refresh_tree()
+        menu = app._build_box_menu("0")
+        assert menu.index("end") == 1, "context menu must have 2 entries"
+        menu.destroy()
+        app.findings.clear()
+        app._refresh_tree()
         # extraction dialog must construct without a document
         dlg = app._build_extract_dialog()
         dlg.destroy()

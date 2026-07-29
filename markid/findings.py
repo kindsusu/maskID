@@ -58,10 +58,13 @@ class Finding:
     rect_back6: Optional[Rect] = None   # sub-rect for scope=back6 (rrn only)
     conf: str = "high"             # high | low
     enabled: bool = True
+    user_adjusted: bool = False    # box moved/resized by the user (v1.5.0)
 
     def rect_for_scope(self, scope: str) -> Optional[Rect]:
         """Return the rectangle to mask for *scope*, or None to skip.
 
+        - user_adjusted: the user moved/resized this box — mask exactly the
+          adjusted rect, whatever the scope or kind (user intent wins).
         - rrn         : back6 -> rect_back6 (fallback: whole rect), full -> rect.
                         OCR findings carry a width-weighted back6 estimate with
                         a safety bias (left edge widened toward the gender
@@ -70,6 +73,8 @@ class Finding:
         - rrn_partial : back6 -> skipped (front digits only), full -> rect
         - address/manual: always the full rect
         """
+        if self.user_adjusted:
+            return self.rect
         if self.kind == "rrn":
             if scope == "back6":
                 return self.rect_back6 if self.rect_back6 else self.rect
@@ -89,6 +94,7 @@ class Finding:
             "text": self.text,
             "conf": self.conf,
             "enabled": self.enabled,
+            "user_adjusted": self.user_adjusted,
             "rect": [round(v, 2) for v in self.rect],
             "rect_back6": (
                 [round(v, 2) for v in self.rect_back6] if self.rect_back6 else None
