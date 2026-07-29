@@ -9,8 +9,8 @@
 VSVersionInfo(
   ffi=FixedFileInfo(
     # filevers and prodvers must each be a 4-tuple: (major, minor, patch, build)
-    filevers=(1, 4, 1, 0),
-    prodvers=(1, 4, 1, 0),
+    filevers=(1, 4, 2, 0),
+    prodvers=(1, 4, 2, 0),
     # Contains a bitmask that specifies the valid bits 'flags'
     mask=0x3f,
     # Contains a bitmask that specifies the Boolean attributes of the file.
@@ -36,12 +36,12 @@ VSVersionInfo(
         '040904B0',
         [StringStruct('CompanyName', 'HRteam'),
         StringStruct('FileDescription', 'MarkID - 계약서 주민등록번호 마스킹 도구'),
-        StringStruct('FileVersion', '1.4.1.0'),
+        StringStruct('FileVersion', '1.4.2.0'),
         StringStruct('InternalName', 'MarkID'),
         StringStruct('LegalCopyright', 'Copyright (c) 2026 김권수 (HRteam)'),
         StringStruct('OriginalFilename', 'MarkID.exe'),
         StringStruct('ProductName', 'MarkID'),
-        StringStruct('ProductVersion', '1.4.1.0')])
+        StringStruct('ProductVersion', '1.4.2.0')])
       ]),
     VarFileInfo([VarStruct('Translation', [0x0409, 0x04B0])])
   ]

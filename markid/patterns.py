@@ -110,9 +110,15 @@ def find_rrn_partial(text, context_ok=False):
 
     Returns a list of dicts ``{"start", "end"}`` (span of the digits +
     optional hyphen).  ``back6`` is never applicable to partials.
+
+    v1.4.2: the 6 digits must also pass :func:`valid_date6` — a partial RRN
+    is by definition a birth date, so case numbers such as ``…차전127206``
+    (mm=72) can no longer qualify, whatever the context.
     """
     out = []
     for m in RRN_PARTIAL_RE.finditer(text):
+        if not valid_date6(m.group(1)):
+            continue
         left = text[: m.start()]
         if context_ok or RRN_LABEL_RE.search(left):
             out.append({"start": m.start(), "end": m.end()})

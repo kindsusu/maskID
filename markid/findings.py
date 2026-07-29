@@ -62,17 +62,16 @@ class Finding:
     def rect_for_scope(self, scope: str) -> Optional[Rect]:
         """Return the rectangle to mask for *scope*, or None to skip.
 
-        - rrn (text)  : back6 -> rect_back6 (fallback rect), full -> rect
-        - rrn (ocr)   : always the whole rect — OCR boxes are too imprecise
-                        for sub-digit targeting (rotated card numbers can
-                        leave digits visible), so back6 masks the full number
+        - rrn         : back6 -> rect_back6 (fallback: whole rect), full -> rect.
+                        OCR findings carry a width-weighted back6 estimate with
+                        a safety bias (left edge widened toward the gender
+                        digit) since v1.4.2; when the estimate is unavailable
+                        the whole number is masked as before.
         - rrn_partial : back6 -> skipped (front digits only), full -> rect
         - address/manual: always the full rect
         """
         if self.kind == "rrn":
             if scope == "back6":
-                if self.source == "ocr":
-                    return self.rect
                 return self.rect_back6 if self.rect_back6 else self.rect
             return self.rect
         if self.kind == "rrn_partial":
