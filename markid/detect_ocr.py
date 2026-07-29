@@ -25,8 +25,14 @@ the inverse transform to restore page coordinates.
 import fitz
 import numpy as np
 
-from .findings import Finding
-from .patterns import find_addresses, find_rrn_full, find_rrn_partial, mask_display
+from .findings import Finding, to_display
+from .patterns import (
+    corp_context_excluded,
+    find_addresses,
+    find_rrn_full,
+    find_rrn_partial,
+    mask_display,
+)
 
 MIN_IMAGE_PX = 250          # image side threshold that triggers rotation passes
 DPI_UPRIGHT = 240
@@ -116,7 +122,12 @@ def _clamp(rect, bounds):
 
 
 def page_image_rects(page, min_px=MIN_IMAGE_PX):
-    """PDF-space rects of images whose pixel size is at least *min_px* on a side."""
+    """Display-space rects of images at least *min_px* px on a side.
+
+    ``get_image_rects`` returns unrotated coords (verified on 1.25.2); the
+    result converts to display space so it matches OCR finding rects and the
+    display-space ``get_pixmap(clip=)`` of the rotated passes.
+    """
     rects = []
     for im in page.get_images(full=True):
         xref, width, height = im[0], im[2], im[3]
@@ -124,10 +135,31 @@ def page_image_rects(page, min_px=MIN_IMAGE_PX):
             continue
         try:
             for r in page.get_image_rects(xref):
-                rects.append((r[0], r[1], r[2], r[3]))
+                rects.append(to_display(page, (r[0], r[1], r[2], r[3])))
         except Exception:
             pass
     return rects
+
+
+def _reads_above(item, reads):
+    """Texts of OCR reads directly above *item* in the reading frame.
+
+    Adjacency: horizontal overlap and a vertical gap of at most ~2 line
+    heights (reading-frame pixels, internally consistent).
+    """
+    x0, y0, x1, y1 = item["box"]
+    h = max(1e-6, y1 - y0)
+    out = []
+    for other in reads:
+        if other is item:
+            continue
+        ox0, oy0, ox1, oy1 = other["box"]
+        if min(x1, ox1) - max(x0, ox0) <= 0:
+            continue
+        gap = y0 - oy1
+        if -0.5 * h <= gap <= 2.0 * h:
+            out.append(other["text"])
+    return out
 
 
 def _card_band(rrn_rb, reads, to_pdf, card_rect):
@@ -199,11 +231,16 @@ def _run_pass(page, page_index, k, dpi, image_rects, address_on, clip_rect=None)
         pdf_line = to_pdf(rb)
         card_rect = _inside_image(pdf_line, image_rects)
         in_img = card_rect is not None
+        # Corporate/business context: skip RRN-shaped hits for this read
+        # (adjacent line above may carry the marker, e.g. company name).
+        corp_excluded = corp_context_excluded(text, _reads_above(item, reads))
 
         full_spans = []
         # --- full RRN ---
         for hit in find_rrn_full(text):
             full_spans.append((hit["start"], hit["end"]))
+            if corp_excluded:
+                continue
             rect = to_pdf(_frac_box(rb, hit["start"], hit["end"], L))
             # No rect_back6 for OCR findings: box estimates are too loose for
             # sub-digit targeting, so back6 scope masks the whole number.
@@ -220,7 +257,7 @@ def _run_pass(page, page_index, k, dpi, image_rects, address_on, clip_rect=None)
                 ))
 
         # --- partial RRN: only inside an ID/verification image ---
-        if in_img:
+        if in_img and not corp_excluded:
             for hit in find_rrn_partial(text, context_ok=True):
                 if any(fs <= hit["start"] and hit["end"] <= fe for fs, fe in full_spans):
                     continue

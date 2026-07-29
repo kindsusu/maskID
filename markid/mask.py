@@ -11,6 +11,8 @@ import io
 import fitz
 from PIL import Image
 
+from .findings import to_unrotated
+
 
 def pad_rect(rect, pad=1.0):
     """Grow *rect* by ``pad`` pt horizontally; vertical padding capped at 20%."""
@@ -73,10 +75,16 @@ def snap_rect_away_from_lines(rect, line_bboxes, graze_frac=0.35, gap=0.2):
 def apply_masks(page, rect_items, style, line_bboxes=None):
     """Redact and visually mask rects on *page*.
 
-    *rect_items* is a list of ``(rect, source)`` pairs.  OCR-sourced rects are
-    snapped away from neighbouring text lines after padding (their detector
-    boxes are loose); text/annot rects are char-bbox precise and manual rects
+    *rect_items* is a list of ``(rect, source)`` pairs in **display**
+    coordinates (as is every Finding rect).  OCR-sourced rects are snapped
+    away from neighbouring text lines after padding (their detector boxes
+    are loose); text/annot rects are char-bbox precise and manual rects
     reflect user intent, so those are used as-is.
+
+    Coordinate boundaries (verified on PyMuPDF 1.25.2): ``get_pixmap(clip=)``
+    takes display coords — used as-is for the mosaic raster — while
+    ``add_redact_annot`` and ``insert_image`` take unrotated coords, so rects
+    are converted right at those calls.  Rotation 0 keeps everything as-is.
 
     Returns the number of rectangles masked.
     """
@@ -92,7 +100,8 @@ def apply_masks(page, rect_items, style, line_bboxes=None):
     if not clean:
         return 0
 
-    # Capture pixelated rasters *before* the pixels are removed.
+    # Capture pixelated rasters *before* the pixels are removed
+    # (clip= addresses display space: pass the display rect unchanged).
     mosaics = []
     if style == "mosaic":
         for r in clean:
@@ -103,7 +112,7 @@ def apply_masks(page, rect_items, style, line_bboxes=None):
 
     fill = (0, 0, 0) if style == "box" else (1, 1, 1)
     for r in clean:
-        page.add_redact_annot(fitz.Rect(*r), fill=fill)
+        page.add_redact_annot(fitz.Rect(*to_unrotated(page, r)), fill=fill)
 
     # Physically remove text + image pixels; keep vector line art (table borders).
     page.apply_redactions(
@@ -114,6 +123,7 @@ def apply_masks(page, rect_items, style, line_bboxes=None):
     if style == "mosaic":
         for r, png in mosaics:
             if png:
-                page.insert_image(fitz.Rect(*r), stream=png)
+                page.insert_image(fitz.Rect(*to_unrotated(page, r)),
+                                  stream=png, keep_proportion=False)
 
     return len(clean)

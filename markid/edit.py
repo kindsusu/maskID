@@ -12,6 +12,8 @@ from typing import Optional, Tuple
 
 import fitz
 
+from .findings import to_display, to_unrotated
+
 Rect = Tuple[float, float, float, float]
 
 
@@ -37,12 +39,16 @@ def _span_color_rgb(color_int):
 def chars_in_rect(page, rect):
     """Collect text-layer chars whose bbox centre lies inside *rect*.
 
+    *rect* arrives in display coordinates (GUI canvas); rawdict char boxes
+    are unrotated (PyMuPDF 1.25.2, verified), so the input is converted for
+    the comparison and the returned tight rect is converted back to display.
+
     Returns ``(text, tight_rect, size, color)`` — chars joined in line order
     (lines joined with a space), the tight union of their bboxes, and the
     font size / colour of the first contributing span — or ``None`` when the
     selection contains no text-layer characters (e.g. scanned images).
     """
-    x0, y0, x1, y1 = rect
+    x0, y0, x1, y1 = to_unrotated(page, rect)
     d = page.get_text("rawdict")
     picked_lines = []
     first_span = None
@@ -77,7 +83,7 @@ def chars_in_rect(page, rect):
     )
     size = float(first_span.get("size", 10.0)) if first_span else 10.0
     color = _span_color_rgb(first_span.get("color", 0)) if first_span else (0, 0, 0)
-    return text, tight, size, color
+    return text, to_display(page, tight), size, color
 
 
 def _fit_font_size(text, size, max_width):
@@ -107,8 +113,11 @@ def apply_edit(page, op) -> bool:
     images and line art), then the new text is inserted into the same box.
     Returns True when the inserted text had to shrink below 0.5x to fit
     (caller may want to warn the user).
+
+    ``op.rect`` is display space; ``add_redact_annot`` / ``insert_htmlbox``
+    expect unrotated coords (verified), so the rect converts here.
     """
-    rect = fitz.Rect(*op.rect)
+    rect = fitz.Rect(*to_unrotated(page, op.rect))
     page.add_redact_annot(rect)
     page.apply_redactions(
         images=fitz.PDF_REDACT_IMAGE_NONE,       # keep background images

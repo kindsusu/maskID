@@ -1,9 +1,35 @@
-"""Finding model, rectangle helpers, and de-duplication."""
+"""Finding model, rectangle helpers, and de-duplication.
+
+Coordinate convention (v1.4.1, empirically verified on PyMuPDF 1.25.2):
+``Finding.rect`` / ``EditOp.rect`` are always in **display** space — the
+rotation-applied coordinate system that ``get_pixmap`` renders and
+``get_pixmap(clip=)`` addresses.  PyMuPDF APIs that speak the *unrotated*
+space (``get_text`` bboxes, ``add_redact_annot``, ``annot.rect``,
+``insert_image``, ``insert_htmlbox``) are converted at the call boundary
+with :func:`to_display` / :func:`to_unrotated`.  For rotation 0 both are
+the identity.
+"""
 
 from dataclasses import dataclass, field
 from typing import Optional, Tuple
 
+import fitz
+
 Rect = Tuple[float, float, float, float]  # (x0, y0, x1, y1) in PDF points
+
+
+def to_display(page, rect):
+    """Unrotated page coords -> display (rotation-applied) coords."""
+    if page.rotation % 360 == 0:
+        return tuple(rect)
+    return tuple(fitz.Rect(rect) * page.rotation_matrix)
+
+
+def to_unrotated(page, rect):
+    """Display (rotation-applied) coords -> unrotated page coords."""
+    if page.rotation % 360 == 0:
+        return tuple(rect)
+    return tuple(fitz.Rect(rect) * page.derotation_matrix)
 
 
 # Kind -> Korean label used in the GUI list.
@@ -139,3 +165,36 @@ def dedup(findings, iou_thr=0.4):
             result_idx.add(i)
     # Preserve original ordering for the survivors.
     return [findings[i] for i in range(len(findings)) if i in result_idx]
+
+
+def prune_loose_rrn(findings):
+    """Drop loose (line-wide) duplicates of the same OCR-read number.
+
+    A whole-line OCR read that *contains* an RRN yields a character-fraction
+    box estimate spanning much of the line, while another read of the number
+    as its own segment yields a tight box.  Both survive :func:`dedup` when
+    the vertical overlap is too small for IoU/containment.
+
+    Rule (validated on a real rotated-scan sample): for two **OCR** findings
+    of the same kind and same display text on the same page whose vertical
+    ranges overlap (same visual row) and whose horizontal ranges intersect,
+    keep the tighter (smaller-area) box and drop the looser one.
+    """
+    drop = set()
+    for i, f in enumerate(findings):
+        if f.source != "ocr" or f.kind not in ("rrn", "rrn_partial"):
+            continue
+        for j, g in enumerate(findings):
+            if j <= i or g.source != "ocr":
+                continue
+            if g.page != f.page or g.kind != f.kind or g.text != f.text:
+                continue
+            fh = f.rect[3] - f.rect[1]
+            gh = g.rect[3] - g.rect[1]
+            v_ov = min(f.rect[3], g.rect[3]) - max(f.rect[1], g.rect[1])
+            if v_ov < 0.5 * max(1e-6, min(fh, gh)):
+                continue                      # different rows: keep both
+            if min(f.rect[2], g.rect[2]) - max(f.rect[0], g.rect[0]) <= 0:
+                continue                      # no horizontal intersection
+            drop.add(j if rect_area(g.rect) >= rect_area(f.rect) else i)
+    return [f for k, f in enumerate(findings) if k not in drop]

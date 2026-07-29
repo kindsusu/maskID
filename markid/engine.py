@@ -17,7 +17,7 @@ import fitz
 from .detect_ocr import detect_page_ocr, page_image_rects
 from .detect_text import delete_rrn_annots, detect_annots, detect_text
 from .edit import apply_edits
-from .findings import Finding, dedup
+from .findings import Finding, dedup, prune_loose_rrn, to_display
 from .mask import apply_masks
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".gif"}
@@ -164,7 +164,7 @@ def detect(doc, opts, progress=None, cancel=None, **pinfo) -> List[Finding]:
             findings += detect_page_ocr(
                 page, i, irects, opts.address, progress=progress, cancel=cancel
             )
-    findings = dedup(findings)
+    findings = prune_loose_rrn(dedup(findings))
     for idx, f in enumerate(findings):
         f.id = idx
     return findings
@@ -267,7 +267,11 @@ def apply_and_save(doc, findings, opts, out_path, edits=None, progress=None,
 
 
 def _page_line_bboxes(page):
-    """Text-layer line bounding boxes for one page (for OCR-rect snapping)."""
+    """Text-layer line bounding boxes for one page (for OCR-rect snapping).
+
+    get_text bboxes are unrotated (verified); converted to display space so
+    they compare against OCR finding rects in the same coordinate system.
+    """
     out = []
     try:
         d = page.get_text("dict")
@@ -279,7 +283,7 @@ def _page_line_bboxes(page):
         for line in block.get("lines", []):
             bb = line.get("bbox")
             if bb:
-                out.append(tuple(bb))
+                out.append(to_display(page, tuple(bb)))
     return out
 
 

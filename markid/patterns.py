@@ -39,6 +39,33 @@ RRN_PARTIAL_RE = re.compile(
 
 RRN_LABEL_RE = re.compile(r"주민")
 
+# Corporate / business context markers.  A corporate registration number
+# (법인등록번호, 6-7 digits) is structurally identical to an RRN and its date
+# part often validates, so context is the only reliable discriminator.
+CORP_CONTEXT_RE = re.compile(r"사업자|법인|주식회사|\(주|㈜")
+
+
+def corp_context_excluded(line_text, above_texts=()):
+    """True when RRN-shaped numbers in *line_text* are corporate context.
+
+    Rules (over-masking is preferred to under-masking):
+    - a ``주민`` label in the line always wins -> never excluded;
+    - a corporate marker in the same line -> excluded;
+    - otherwise, when the line itself carries no clue, a corporate marker in
+      an adjacent line above (caller supplies *above_texts*) excludes —
+      unless that line mentions ``주민``.
+    """
+    if RRN_LABEL_RE.search(line_text):
+        return False
+    if CORP_CONTEXT_RE.search(line_text):
+        return True
+    for t in above_texts:
+        if RRN_LABEL_RE.search(t):
+            return False
+        if CORP_CONTEXT_RE.search(t):
+            return True
+    return False
+
 
 def valid_date6(six):
     """True when the 6-digit prefix looks like a real YYMMDD date."""

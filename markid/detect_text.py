@@ -5,9 +5,10 @@ pattern logic.  Precise masking rectangles come from the union of the matched
 characters' bounding boxes, so masking never spills into neighbouring text.
 """
 
-from .findings import Finding, iou, union_rect
+from .findings import Finding, iou, to_display, union_rect
 from .patterns import (
     RRN_LABEL_RE,
+    corp_context_excluded,
     find_addresses,
     find_rrn_full,
     find_rrn_partial,
@@ -68,18 +69,47 @@ def _rect_from_span(chars, start, end):
     return union_rect([bb for _, bb in chars[start:end]])
 
 
+def _lines_above(line, lines):
+    """Texts of lines directly above *line* (h-overlap, gap <= ~2 line heights).
+
+    Geometry runs in the rawdict (unrotated) space, internally consistent.
+    """
+    x0, y0, x1, y1 = line["bbox"]
+    h = max(1e-6, y1 - y0)
+    out = []
+    for other in lines:
+        if other is line:
+            continue
+        ox0, oy0, ox1, oy1 = other["bbox"]
+        if min(x1, ox1) - max(x0, ox0) <= 0:
+            continue                       # no horizontal overlap
+        gap = y0 - oy1                     # vertical gap above
+        if -0.5 * h <= gap <= 2.0 * h:
+            out.append(other["text"])
+    return out
+
+
 def detect_text(page, page_index, address_on):
-    """Detect RRNs (full/partial) and, optionally, addresses in the text layer."""
+    """Detect RRNs (full/partial) and, optionally, addresses in the text layer.
+
+    rawdict boxes are in the unrotated space (PyMuPDF 1.25.2, verified);
+    Finding rects are converted to display space at the end.
+    """
     lines = _collect_lines(page)
     out = []
     for line in lines:
         text = line["text"]
         chars = line["chars"]
+        # Corporate/business-number context: skip RRN-shaped hits on this
+        # line (never when a 주민 label is present anywhere relevant).
+        corp_excluded = corp_context_excluded(text, _lines_above(line, lines))
 
         # --- full RRN ---
         full_spans = []
         for hit in find_rrn_full(text):
             full_spans.append((hit["start"], hit["end"]))
+            if corp_excluded:
+                continue
             conf = hit["conf"]
             if conf == "low" and _has_rrn_label_left(line, lines):
                 conf = "high"
@@ -90,8 +120,9 @@ def detect_text(page, page_index, address_on):
                     kind="rrn",
                     source="text",
                     text=mask_display("rrn", text[hit["start"]:hit["end"]]),
-                    rect=_rect_from_span(chars, hit["start"], hit["end"]),
-                    rect_back6=_rect_from_span(chars, hit["back6_start"], hit["back6_end"]),
+                    rect=to_display(page, _rect_from_span(chars, hit["start"], hit["end"])),
+                    rect_back6=to_display(
+                        page, _rect_from_span(chars, hit["back6_start"], hit["back6_end"])),
                     conf=conf,
                 )
             )
@@ -102,6 +133,8 @@ def detect_text(page, page_index, address_on):
             # skip if this span sits inside an already-matched full RRN
             if any(fs <= hit["start"] and hit["end"] <= fe for fs, fe in full_spans):
                 continue
+            if corp_excluded:
+                continue
             out.append(
                 Finding(
                     id=-1,
@@ -109,7 +142,7 @@ def detect_text(page, page_index, address_on):
                     kind="rrn_partial",
                     source="text",
                     text=mask_display("rrn_partial", text[hit["start"]:hit["end"]]),
-                    rect=_rect_from_span(chars, hit["start"], hit["end"]),
+                    rect=to_display(page, _rect_from_span(chars, hit["start"], hit["end"])),
                     rect_back6=None,
                     conf="high",
                 )
@@ -125,7 +158,7 @@ def detect_text(page, page_index, address_on):
                         kind="address",
                         source="text",
                         text=mask_display("address", text[start:end]),
-                        rect=_rect_from_span(chars, start, end),
+                        rect=to_display(page, _rect_from_span(chars, start, end)),
                         rect_back6=None,
                     )
                 )
@@ -157,11 +190,14 @@ def detect_annots(page, page_index):
         text = _annot_text(annot)
         if not text:
             continue
+        if corp_context_excluded(text):
+            continue                       # corporate-number overlay
         full = find_rrn_full(text)
         partial = find_rrn_partial(text)
         if not full and not partial:
             continue
-        rect = tuple(annot.rect)
+        # annot.rect is unrotated (verified) -> convert to display space
+        rect = to_display(page, tuple(annot.rect))
         kind = "rrn" if full else "rrn_partial"
         raw = text[full[0]["start"]:full[0]["end"]] if full else text
         out.append(
@@ -195,12 +231,13 @@ def delete_rrn_annots(page, skip_rects=None):
         text = _annot_text(annot)
         if not (text and (find_rrn_full(text) or find_rrn_partial(text))):
             continue
-        r = annot.rect
-        cx = (r.x0 + r.x1) / 2.0
-        cy = (r.y0 + r.y1) / 2.0
+        # skip_rects are Finding rects (display space) -> compare in display
+        rd = to_display(page, tuple(annot.rect))
+        cx = (rd[0] + rd[2]) / 2.0
+        cy = (rd[1] + rd[3]) / 2.0
         keep = any(
             (s[0] <= cx <= s[2] and s[1] <= cy <= s[3])
-            or iou((r.x0, r.y0, r.x1, r.y1), s) >= 0.4
+            or iou(rd, s) >= 0.4
             for s in skip_rects
         )
         if keep:
